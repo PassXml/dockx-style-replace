@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>DOCX 样式管理工具</title>
+    <style>
+        body { font-family: sans-serif; margin: 0; padding: 24px; background: #f7f7f9; }
+        h1 { margin-top: 0; }
+        .section { background: #fff; border-radius: 8px; padding: 16px 20px; margin-bottom: 20px; box-shadow: 0 2px 6px rgba(0,0,0,0.08); }
+        .section h2 { margin-top: 0; font-size: 18px; }
+        label { display: block; margin-top: 10px; font-weight: 600; }
+        input[type="file"], input[type="text"], textarea { width: 100%; margin-top: 6px; }
+        button { margin-top: 12px; padding: 8px 16px; border: none; background: #0077ff; color: #fff; border-radius: 4px; cursor: pointer; }
+        button:disabled { opacity: 0.6; cursor: not-allowed; }
+        .result { margin-top: 10px; padding: 10px; background: #eef3ff; border-radius: 4px; font-size: 14px; }
+        .error { background: #ffecec; color: #9b0000; }
+        .download-link { color: #0a58ca; text-decoration: underline; cursor: pointer; }
+        .flex { display: flex; gap: 12px; flex-wrap: wrap; }
+        .flex label { flex: 1; }
+    </style>
+</head>
+<body>
+<h1>DOCX 样式管理工具</h1>
+
+<div class="section" id="list-section">
+    <h2>1. 读取样式列表</h2>
+    <form id="list-form">
+        <label>文档文件 (.doc/.docx)
+            <input type="file" name="file" accept=".doc,.docx" required>
+        </label>
+        <button type="submit">获取样式列表</button>
+    </form>
+    <div class="result" id="list-result"></div>
+</div>
+
+<div class="section" id="export-section">
+    <h2>2. 导出样式 CSV</h2>
+    <form id="export-form">
+        <label>文档文件 (.doc/.docx)
+            <input type="file" name="file" accept=".doc,.docx" required>
+        </label>
+        <button type="submit">导出 CSV</button>
+    </form>
+    <div class="result" id="export-result"></div>
+</div>
+
+<div class="section" id="migrate-section">
+    <h2>3. 迁移样式</h2>
+    <form id="migrate-form">
+        <label>来源文件 (.doc/.docx，可留空使用默认模板)
+            <input type="file" name="sourceFile" accept=".doc,.docx">
+        </label>
+        <label>目标文件 (.doc/.docx)
+            <input type="file" name="targetFile" accept=".doc,.docx" required>
+        </label>
+        <label>样式列表（逗号分隔，输入 * 表示迁移全部）
+            <input type="text" value="*" name="styles" placeholder="例如：Title,CustomHeading 或 *">
+        </label>
+        <label>或上传样式清单文件
+            <input type="file" name="stylesFile" accept=".txt,.csv">
+        </label>
+        <div class="flex">
+            <label>
+                <input type="checkbox" name="copyNumbering" checked> 同步复制编号
+            </label>
+            <label>
+                <input type="checkbox" name="includeDependencies" checked> 包含 basedOn 依赖
+            </label>
+        </div>
+        <button type="submit">执行迁移</button>
+    </form>
+    <div class="result" id="migrate-result"></div>
+</div>
+
+<div class="section" id="clean-section">
+    <h2>4. 清理指定样式</h2>
+    <form id="clean-form">
+        <label>目标文件 (.doc/.docx)
+            <input type="file" name="file" accept=".doc,.docx" required>
+        </label>
+        <label>样式列表（逗号分隔）
+            <input type="text" name="styles" placeholder="例如：Heading,Quote">
+        </label>
+        <label>或上传样式清单文件
+            <input type="file" name="stylesFile" accept=".txt,.csv">
+        </label>
+        <button type="submit">执行清理</button>
+    </form>
+    <div class="result" id="clean-result"></div>
+</div>
+
+<script>
+    const apiBase = '';
+
+    const forms = [
+        {id: 'list-form', endpoint: '/api/styles/list', result: 'list-result', type: 'json'},
+        {id: 'export-form', endpoint: '/api/styles/export', result: 'export-result', type: 'blob', filename: 'styles.csv'},
+        {id: 'migrate-form', endpoint: '/api/styles/migrate', result: 'migrate-result', type: 'blob', filename: 'migrated.docx'},
+        {id: 'clean-form', endpoint: '/api/styles/clean', result: 'clean-result', type: 'blob', filename: 'cleaned.docx'}
+    ];
+
+    forms.forEach(({id, endpoint, result, type, filename}) => {
+        const form = document.getElementById(id);
+        const output = document.getElementById(result);
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            output.textContent = '处理中...';
+            output.classList.remove('error');
+            const formData = new FormData(form);
+            try {
+                const response = await fetch(apiBase + endpoint, {
+                    method: 'POST',
+                    body: formData
+                });
+                if (!response.ok) {
+                    const text = await response.text();
+                    throw new Error(text || '请求失败');
+                }
+                if (type === 'json') {
+                    const data = await response.json();
+                    output.innerHTML = `<strong>样式数量：</strong>${data.styles.length}<br>` +
+                        data.styles.map(s => `${s.styleId || '(无ID)'} - ${s.name || '(无名称)'} - ${s.type || '(类型未知)'}`).join('<br>');
+                } else if (type === 'blob') {
+                    const blob = await response.blob();
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = filename || 'result';
+                    link.className = 'download-link';
+                    link.textContent = '下载结果文件';
+                    output.innerHTML = '';
+                    output.appendChild(link);
+                    const removed = response.headers.get('X-Removed-Count');
+                    if (removed) {
+                        const info = document.createElement('div');
+                        info.textContent = `已删除样式数量：${removed}`;
+                        info.style.marginTop = '8px';
+                        output.appendChild(info);
+                    }
+                }
+            } catch (err) {
+                output.textContent = `错误：${err.message}`;
+                output.classList.add('error');
+            }
+        });
+    });
+</script>
+</body>
+</html>

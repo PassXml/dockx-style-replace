@@ -16,6 +16,7 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -144,18 +145,68 @@ public class DocxStyleServer {
 
     private Path saveUploadedFile(UploadedFile upload, String prefix, Set<String> allowedExtensions) throws IOException {
         String originalName = upload.filename();
-        String extension = originalName == null ? "" : FilenameUtils.getExtension(originalName).toLowerCase();
-        if (allowedExtensions != null && !allowedExtensions.isEmpty()) {
-            if (extension.isEmpty() || !allowedExtensions.contains(extension)) {
-                throw new BadRequestResponse("文件格式不被允许: " + originalName);
-            }
-        }
-        String suffix = extension.isEmpty() ? ".tmp" : "." + extension;
-        Path temp = Files.createTempFile(workDir, prefix, suffix);
+        Path temp = Files.createTempFile(workDir, prefix, ".tmp");
         try (var in = upload.content()) {
             Files.copy(in, temp, StandardCopyOption.REPLACE_EXISTING);
         }
-        return temp;
+        String detectedExtension;
+        try {
+            detectedExtension = detectDocExtension(temp, originalName);
+        } catch (IOException | RuntimeException ex) {
+            deleteQuiet(temp);
+            throw ex;
+        }
+        if (allowedExtensions != null && !allowedExtensions.isEmpty() && !allowedExtensions.contains(detectedExtension)) {
+            deleteQuiet(temp);
+            throw new BadRequestResponse("文件格式不被允许: " + safeOriginalName(originalName));
+        }
+        return ensureExtension(temp, detectedExtension);
+    }
+
+    private String detectDocExtension(Path file, String originalName) throws IOException {
+        byte[] header = new byte[8];
+        int read;
+        try (var in = Files.newInputStream(file)) {
+            read = in.read(header);
+        }
+        if (read >= 4) {
+            if ((header[0] & 0xFF) == 0x50 && (header[1] & 0xFF) == 0x4B && (header[2] & 0xFF) == 0x03 && (header[3] & 0xFF) == 0x04) {
+                return "docx";
+            }
+        }
+        if (read >= 8) {
+            int[] ole = {0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1};
+            boolean match = true;
+            for (int i = 0; i < ole.length; i++) {
+                if ((header[i] & 0xFF) != ole[i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                return "doc";
+            }
+        }
+        String extensionHint = originalName == null ? "" : FilenameUtils.getExtension(originalName).toLowerCase(Locale.ROOT);
+        if ("doc".equals(extensionHint) || "docx".equals(extensionHint)) {
+            return extensionHint;
+        }
+        throw new BadRequestResponse("无法识别的文档格式: " + safeOriginalName(originalName));
+    }
+
+    private Path ensureExtension(Path file, String extension) throws IOException {
+        String filename = file.getFileName().toString();
+        int dot = filename.lastIndexOf('.');
+        String base = dot >= 0 ? filename.substring(0, dot) : filename;
+        Path target = file.resolveSibling(base + "." + extension);
+        return Files.move(file, target, StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    private String safeOriginalName(String name) {
+        if (name == null || name.isBlank()) {
+            return "(未知文件)";
+        }
+        return name;
     }
 
     private Path extractTemplate(String prefix) throws IOException {

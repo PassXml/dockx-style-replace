@@ -9,16 +9,25 @@ import org.apache.commons.io.FilenameUtils;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.LinkedHashMap;
+import java.util.HashSet;
+import java.util.HashMap;
+import java.util.function.Function;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 /**
  * 使用 Javalin 提供同步的 Web API。
@@ -77,25 +86,100 @@ public class DocxStyleServer {
         });
 
         app.post("/api/styles/migrate", ctx -> {
+            // 支持单文件与多文件目标：
+            // - 若仅上传一个 targetFile，则行为与之前相同，直接返回处理后的 DOCX
+            // - 若上传多个 targetFile，则对每个文件执行迁移，并打包为一个 ZIP 返回
+            List<UploadedFile> targetUploads = ctx.uploadedFiles("targetFile");
+            if (targetUploads == null || targetUploads.isEmpty()) {
+                throw new BadRequestResponse("缺少上传字段: targetFile");
+            }
+
             Path source = saveUploadOrTemplate(ctx, "sourceFile", "src-");
-            Path target = saveUpload(ctx, "targetFile", "dst-", Set.of("doc", "docx"));
             StyleSelection selection = resolveStyleSelection(ctx, true);
             boolean copyNumbering = parseBoolean(ctx.formParam("copyNumbering"), true);
             boolean includeDependencies = parseBoolean(ctx.formParam("includeDependencies"), true);
+
+            if (targetUploads.size() == 1) {
+                // 保持原有单文件行为
+                UploadedFile upload = targetUploads.get(0);
+                Path target = saveUploadedFile(upload, "dst-", Set.of("doc", "docx"));
+                try {
+                    Path result;
+                    if (selection.allStyles()) {
+                        result = service.migrateAll(source, target, copyNumbering);
+                    } else {
+                        result = service.migrate(source, target, selection.names(), copyNumbering, includeDependencies);
+                    }
+                    sendDocx(ctx, result, "migrated.docx");
+                    if (!result.equals(target)) {
+                        deleteQuiet(result);
+                    }
+                } finally {
+                    deleteQuiet(source);
+                    deleteQuiet(target);
+                }
+                return;
+            }
+
+            // 多文件批量迁移：返回 ZIP，包内文件名为原始上传文件名
+            List<Path> targets = new ArrayList<>();
+            List<Path> results = new ArrayList<>();
+            List<String> originalNames = new ArrayList<>();
+            Path zip = null;
             try {
-                Path result;
-                if (selection.allStyles()) {
-                    result = service.migrateAll(source, target, copyNumbering);
-                } else {
-                    result = service.migrate(source, target, selection.names(), copyNumbering, includeDependencies);
+                for (UploadedFile upload : targetUploads) {
+                    if (upload == null || upload.size() == 0) {
+                        continue;
+                    }
+                    Path target = saveUploadedFile(upload, "dst-", Set.of("doc", "docx"));
+                    targets.add(target);
+                    originalNames.add(safeOriginalName(upload.filename()));
+                    Path result;
+                    if (selection.allStyles()) {
+                        result = service.migrateAll(source, target, copyNumbering);
+                    } else {
+                        result = service.migrate(source, target, selection.names(), copyNumbering, includeDependencies);
+                    }
+                    results.add(result);
                 }
-                sendDocx(ctx, result, "migrated.docx");
-                if (!result.equals(target)) {
-                    deleteQuiet(result);
+
+                if (results.isEmpty()) {
+                    throw new BadRequestResponse("未收到有效的目标文件。");
                 }
+
+                zip = Files.createTempFile(workDir, "migrated-", ".zip");
+                try (OutputStream out = Files.newOutputStream(zip);
+                     ZipOutputStream zos = new ZipOutputStream(out)) {
+                    Set<String> usedNames = new LinkedHashSet<>();
+                    for (int i = 0; i < results.size(); i++) {
+                        Path result = results.get(i);
+                        String originalName = originalNames.get(i);
+                        if (originalName == null || originalName.isBlank()) {
+                            originalName = result.getFileName().toString();
+                        }
+                        String entryName = ensureUniqueName(originalName, usedNames);
+                        zos.putNextEntry(new ZipEntry(entryName));
+                        try (InputStream in = Files.newInputStream(result)) {
+                            in.transferTo(zos);
+                        }
+                        zos.closeEntry();
+                    }
+                }
+
+                sendZip(ctx, zip, "migrated.zip");
             } finally {
                 deleteQuiet(source);
-                deleteQuiet(target);
+                for (int i = 0; i < results.size(); i++) {
+                    Path result = results.get(i);
+                    Path target = i < targets.size() ? targets.get(i) : null;
+                    if (result != null && !result.equals(target)) {
+                        deleteQuiet(result);
+                    }
+                }
+                for (Path target : targets) {
+                    deleteQuiet(target);
+                }
+                deleteQuiet(zip);
             }
         });
 
@@ -125,6 +209,31 @@ public class DocxStyleServer {
         ctx.contentType("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
         ctx.header("Content-Disposition", "attachment; filename=\"" + filename + "\"");
         ctx.result(bytes);
+    }
+
+    private void sendZip(Context ctx, Path file, String filename) throws IOException {
+        byte[] bytes = Files.readAllBytes(file);
+        ctx.contentType("application/zip");
+        ctx.header("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+        ctx.result(bytes);
+    }
+
+    private String ensureUniqueName(String name, Set<String> used) {
+        String base = name;
+        String ext = "";
+        int dot = name.lastIndexOf('.');
+        if (dot > 0 && dot < name.length() - 1) {
+            base = name.substring(0, dot);
+            ext = name.substring(dot);
+        }
+        String candidate = name;
+        int index = 1;
+        while (used.contains(candidate)) {
+            candidate = base + "(" + index + ")" + ext;
+            index++;
+        }
+        used.add(candidate);
+        return candidate;
     }
 
     private Path saveUploadOrTemplate(Context ctx, String field, String prefix) throws IOException {

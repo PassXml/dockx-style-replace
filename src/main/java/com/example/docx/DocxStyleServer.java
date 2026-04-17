@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -183,6 +184,23 @@ public class DocxStyleServer {
             }
         });
 
+        app.post("/api/styles/format", ctx -> {
+            UploadedFile upload = ctx.uploadedFile("file");
+            if (upload == null) {
+                throw new BadRequestResponse("缺少上传字段: file");
+            }
+            Path target = saveUploadedFile(upload, "format-", Set.of("doc", "docx"));
+            try {
+                Path result = service.formatDocument(target);
+                sendDocx(ctx, result, buildFormattedFilename(upload.filename()));
+                if (!result.equals(target)) {
+                    deleteQuiet(result);
+                }
+            } finally {
+                deleteQuiet(target);
+            }
+        });
+
         app.post("/api/styles/clean", ctx -> {
             Path target = saveUpload(ctx, "file", "clean-", Set.of("doc", "docx"));
             StyleSelection selection = resolveStyleSelection(ctx, false);
@@ -207,15 +225,26 @@ public class DocxStyleServer {
     private void sendDocx(Context ctx, Path file, String filename) throws IOException {
         byte[] bytes = Files.readAllBytes(file);
         ctx.contentType("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
-        ctx.header("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+        ctx.header("Content-Disposition", buildAttachmentDisposition(filename));
         ctx.result(bytes);
     }
 
     private void sendZip(Context ctx, Path file, String filename) throws IOException {
         byte[] bytes = Files.readAllBytes(file);
         ctx.contentType("application/zip");
-        ctx.header("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+        ctx.header("Content-Disposition", buildAttachmentDisposition(filename));
         ctx.result(bytes);
+    }
+
+    private String buildAttachmentDisposition(String filename) {
+        String safeFilename = safeOriginalName(filename);
+        String asciiFilename = safeFilename.replaceAll("[^\\x20-\\x7E]", "_").replace("\"", "");
+        if (asciiFilename.isBlank()) {
+            asciiFilename = "download.docx";
+        }
+        String encodedFilename = URLEncoder.encode(safeFilename, StandardCharsets.UTF_8)
+                .replace("+", "%20");
+        return "attachment; filename=\"" + asciiFilename + "\"; filename*=UTF-8''" + encodedFilename;
     }
 
     private String ensureUniqueName(String name, Set<String> used) {
@@ -316,6 +345,15 @@ public class DocxStyleServer {
             return "(未知文件)";
         }
         return name;
+    }
+
+    private String buildFormattedFilename(String originalName) {
+        String safeName = safeOriginalName(originalName);
+        String baseName = FilenameUtils.getBaseName(safeName);
+        if (baseName == null || baseName.isBlank()) {
+            baseName = "document";
+        }
+        return baseName + "_已格式化.docx";
     }
 
     private Path extractTemplate(String prefix) throws IOException {

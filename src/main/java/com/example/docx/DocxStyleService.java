@@ -94,14 +94,18 @@ import javax.xml.transform.stream.StreamResult;
  * <p>2. “内容格式层”负责把段落、表格、Markdown 渲染成目标模板的视觉效果。</p>
  */
 public class DocxStyleService {
+
     private static final String WORDPROCESSING_DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
     private static final Pattern MARKDOWN_HEADING = Pattern.compile("^(#{1,6})\\s+(.*)$");
     private static final Pattern MARKDOWN_BULLET = Pattern.compile("^(\\s*)[-+*]\\s+(.*)$");
     private static final Pattern MARKDOWN_ORDERED = Pattern.compile("^(\\s*)(\\d+)\\.\\s+(.*)$");
-    private static final Pattern MARKDOWN_TABLE_SEPARATOR = Pattern.compile("^\\s*\\|?(\\s*:?-{3,}:?\\s*\\|)+\\s*:?-{3,}:?\\s*\\|?\\s*$");
-    private static final Pattern MARKDOWN_INLINE = Pattern.compile("(\\*\\*[^*]+\\*\\*|__[^_]+__|`[^`]+`|\\*[^*]+\\*|_[^_]+_)");
+    private static final Pattern MARKDOWN_TABLE_SEPARATOR = Pattern.compile(
+        "^\\s*\\|?(\\s*:?-{3,}:?\\s*\\|)+\\s*:?-{3,}:?\\s*\\|?\\s*$");
+    private static final Pattern MARKDOWN_INLINE = Pattern.compile(
+        "(\\*\\*[^*]+\\*\\*|__[^_]+__|`[^`]+`|\\*[^*]+\\*|_[^_]+_)");
 
-    public Path migrate(Path source, Path target, Set<String> styleNames, boolean copyNumbering, boolean includeDependencies) throws Exception {
+    public Path migrate(Path source, Path target, Set<String> styleNames, boolean copyNumbering,
+        boolean includeDependencies) throws Exception {
         List<Path> tempFiles = new ArrayList<>();
         ConvertedFile src = ensureDocx(source, tempFiles, true);
         ConvertedFile dst = ensureDocx(target, tempFiles, false);
@@ -170,7 +174,7 @@ public class DocxStyleService {
     public Path convertMarkdown(Path markdownFile, Path templatePath, String documentTitle) throws Exception {
         String markdown = Files.readString(markdownFile, StandardCharsets.UTF_8);
         try (InputStream templateIn = Files.newInputStream(templatePath);
-             XWPFDocument document = new XWPFDocument(templateIn)) {
+            XWPFDocument document = new XWPFDocument(templateIn)) {
             // Markdown 转换不是“纯文本导出”，而是借用模板文档作为样式容器，
             // 这样生成后的标题、正文、表格会直接落到模板已有样式上。
             TemplateStyleSet templateStyles = loadTemplateStyleSet(templatePath);
@@ -179,17 +183,19 @@ public class DocxStyleService {
             try (OutputStream out = Files.newOutputStream(output)) {
                 document.write(out);
             }
+            normalizeImageLayout(output);
             return output;
         }
     }
 
-    private void transferStyles(Path srcDocx, Path dstDocx, Set<String> styleNames, boolean copyNumbering, boolean includeDependencies) throws Docx4JException {
+    private void transferStyles(Path srcDocx, Path dstDocx, Set<String> styleNames, boolean copyNumbering,
+        boolean includeDependencies) throws Docx4JException {
         WordprocessingMLPackage srcPkg = WordprocessingMLPackage.load(srcDocx.toFile());
         WordprocessingMLPackage dstPkg = WordprocessingMLPackage.load(dstDocx.toFile());
         MainDocumentPart srcMain = srcPkg.getMainDocumentPart();
         MainDocumentPart dstMain = dstPkg.getMainDocumentPart();
         StyleDefinitionsPart srcStylePart = Optional.ofNullable(srcMain.getStyleDefinitionsPart())
-                .orElseThrow(() -> new IllegalStateException("来源文件缺少样式定义"));
+            .orElseThrow(() -> new IllegalStateException("来源文件缺少样式定义"));
         StyleDefinitionsPart dstStylePart = dstMain.getStyleDefinitionsPart(true);
 
         Map<String, Style> stylesToCopy = collectStyles(srcStylePart, styleNames, includeDependencies);
@@ -208,7 +214,7 @@ public class DocxStyleService {
         MainDocumentPart srcMain = srcPkg.getMainDocumentPart();
         MainDocumentPart dstMain = dstPkg.getMainDocumentPart();
         StyleDefinitionsPart srcStylePart = Optional.ofNullable(srcMain.getStyleDefinitionsPart())
-                .orElseThrow(() -> new IllegalStateException("来源文件缺少样式定义"));
+            .orElseThrow(() -> new IllegalStateException("来源文件缺少样式定义"));
         StyleDefinitionsPart dstStylePart = dstMain.getStyleDefinitionsPart(true);
 
         List<Style> dstList = dstStylePart.getJaxbElement().getStyle();
@@ -258,7 +264,7 @@ public class DocxStyleService {
         WordprocessingMLPackage pkg = WordprocessingMLPackage.load(docxPath.toFile());
         MainDocumentPart main = pkg.getMainDocumentPart();
         StyleDefinitionsPart stylePart = Optional.ofNullable(main.getStyleDefinitionsPart())
-                .orElseThrow(() -> new IllegalStateException("来源文件缺少样式定义"));
+            .orElseThrow(() -> new IllegalStateException("来源文件缺少样式定义"));
         List<Style> styles = new ArrayList<>(stylePart.getJaxbElement().getStyle());
         styles.sort((a, b) -> {
             String idA = a.getStyleId() == null ? "" : a.getStyleId();
@@ -279,7 +285,7 @@ public class DocxStyleService {
         WordprocessingMLPackage pkg = WordprocessingMLPackage.load(docxPath.toFile());
         MainDocumentPart main = pkg.getMainDocumentPart();
         StyleDefinitionsPart stylePart = Optional.ofNullable(main.getStyleDefinitionsPart())
-                .orElseThrow(() -> new IllegalStateException("文件缺少样式定义"));
+            .orElseThrow(() -> new IllegalStateException("文件缺少样式定义"));
         Set<String> normalized = normalizeStyleKeys(styleNames);
         List<Style> styles = stylePart.getJaxbElement().getStyle();
         int before = styles.size();
@@ -292,20 +298,19 @@ public class DocxStyleService {
     }
 
     private void applyDocumentFormat(Path docxPath,
-                                     Path templatePath,
-                                     Map<String, String> originalStyleNames,
-                                     TemplateStyleSet templateStyles) throws IOException {
+        Path templatePath,
+        Map<String, String> originalStyleNames,
+        TemplateStyleSet templateStyles) throws IOException {
         try (InputStream in = Files.newInputStream(docxPath);
-             InputStream templateIn = Files.newInputStream(templatePath);
-             XWPFDocument document = new XWPFDocument(in);
-             XWPFDocument templateDocument = new XWPFDocument(templateIn)) {
+            InputStream templateIn = Files.newInputStream(templatePath);
+            XWPFDocument document = new XWPFDocument(in);
+            XWPFDocument templateDocument = new XWPFDocument(templateIn)) {
             applyTemplateSectionProperties(document, templateDocument);
             formatBodyElements(document.getBodyElements(), originalStyleNames, templateStyles, false);
             try (OutputStream out = Files.newOutputStream(docxPath)) {
                 document.write(out);
             }
         }
-        normalizeImageLayout(docxPath);
     }
 
     private void applyTemplateSectionProperties(XWPFDocument document, XWPFDocument templateDocument) {
@@ -317,9 +322,9 @@ public class DocxStyleService {
     }
 
     private void renderMarkdownDocument(XWPFDocument document,
-                                        String markdown,
-                                        String documentTitle,
-                                        TemplateStyleSet templateStyles) {
+        String markdown,
+        String documentTitle,
+        TemplateStyleSet templateStyles) {
         // 这里是一个很直接的“按行扫描”状态机：
         // 依次识别代码块、标题、表格、列表、引用和普通段落，
         // 每识别出一种块级结构，就把对应内容追加到 Word 文档中。
@@ -394,7 +399,8 @@ public class DocxStyleService {
         return line != null && line.trim().startsWith("```");
     }
 
-    private int appendCodeBlock(XWPFDocument document, List<String> lines, int startIndex, TemplateStyleSet templateStyles) {
+    private int appendCodeBlock(XWPFDocument document, List<String> lines, int startIndex,
+        TemplateStyleSet templateStyles) {
         int index = startIndex + 1;
         while (index < lines.size() && !isFenceStart(lines.get(index))) {
             // 代码块不依赖模板中的专用“代码样式”，而是先使用正文段落，
@@ -432,7 +438,8 @@ public class DocxStyleService {
         return pipeCount >= 1;
     }
 
-    private int appendTableBlock(XWPFDocument document, List<String> lines, int startIndex, TemplateStyleSet templateStyles) {
+    private int appendTableBlock(XWPFDocument document, List<String> lines, int startIndex,
+        TemplateStyleSet templateStyles) {
         List<List<String>> rows = new ArrayList<>();
         rows.add(parseTableRow(lines.get(startIndex)));
         int index = startIndex + 2;
@@ -486,10 +493,10 @@ public class DocxStyleService {
     }
 
     private int appendListBlock(XWPFDocument document,
-                                List<String> lines,
-                                int startIndex,
-                                TemplateStyleSet templateStyles,
-                                MarkdownNumbering numbering) {
+        List<String> lines,
+        int startIndex,
+        TemplateStyleSet templateStyles,
+        MarkdownNumbering numbering) {
         int index = startIndex;
         while (index < lines.size() && isListLine(lines.get(index))) {
             String line = lines.get(index);
@@ -511,9 +518,9 @@ public class DocxStyleService {
             // Markdown 列表最终仍要落到 Word 的编号体系里。
             // 这里通过 numId + ilvl 控制“是有序/无序列表”以及“缩进层级”。
             applyListNumbering(
-                    paragraph,
-                    orderedList ? numbering.orderedNumId() : numbering.bulletNumId(),
-                    resolveListLevel(leadingWhitespace)
+                paragraph,
+                orderedList ? numbering.orderedNumId() : numbering.bulletNumId(),
+                resolveListLevel(leadingWhitespace)
             );
             appendInlineRuns(paragraph, text);
             index++;
@@ -585,7 +592,8 @@ public class DocxStyleService {
         return Math.min(spaces / 2, 8);
     }
 
-    private int appendQuoteBlock(XWPFDocument document, List<String> lines, int startIndex, TemplateStyleSet templateStyles) {
+    private int appendQuoteBlock(XWPFDocument document, List<String> lines, int startIndex,
+        TemplateStyleSet templateStyles) {
         StringBuilder builder = new StringBuilder();
         int index = startIndex;
         while (index < lines.size()) {
@@ -608,12 +616,14 @@ public class DocxStyleService {
         return index;
     }
 
-    private int appendParagraphBlock(XWPFDocument document, List<String> lines, int startIndex, TemplateStyleSet templateStyles) {
+    private int appendParagraphBlock(XWPFDocument document, List<String> lines, int startIndex,
+        TemplateStyleSet templateStyles) {
         StringBuilder builder = new StringBuilder();
         int index = startIndex;
         while (index < lines.size()) {
             String line = lines.get(index);
-            if (line.isBlank() || isFenceStart(line) || isTableBlock(lines, index) || isListLine(line) || line.trim().startsWith(">")) {
+            if (line.isBlank() || isFenceStart(line) || isTableBlock(lines, index) || isListLine(line) || line.trim()
+                .startsWith(">")) {
                 break;
             }
             if (MARKDOWN_HEADING.matcher(line).matches()) {
@@ -714,7 +724,8 @@ public class DocxStyleService {
         return templateStyles.normalStyleId();
     }
 
-    private void formatBodyElements(List<IBodyElement> bodyElements, Map<String, String> originalStyleNames, TemplateStyleSet templateStyles, boolean inTable) {
+    private void formatBodyElements(List<IBodyElement> bodyElements, Map<String, String> originalStyleNames,
+        TemplateStyleSet templateStyles, boolean inTable) {
         for (IBodyElement bodyElement : bodyElements) {
             if (bodyElement instanceof XWPFParagraph paragraph) {
                 if (!inTable) {
@@ -731,6 +742,11 @@ public class DocxStyleService {
     }
 
     private void formatTable(XWPFTable table, TemplateStyleSet templateStyles, int availablePageWidth) {
+        // 表格格式化的主入口，可以把它理解成 4 个阶段：
+        // 1. 清掉原表格样式，避免来源模板的表格主题继续干扰。
+        // 2. 统一设置对齐、内边距、边框、列宽。
+        // 3. 识别“视觉上的表头”到底跨了几行。
+        // 4. 逐个单元格清理段落直设格式，再套用模板里的表头/表体样式。
         removeTableStyle(table);
         table.setTableAlignment(TableRowAlign.CENTER);
         table.setCellMargins(0, 108, 0, 108);
@@ -773,6 +789,8 @@ public class DocxStyleService {
         int span = 1;
         for (int rowIndex = 1; rowIndex < rows.size(); rowIndex++) {
             XWPFTableCell cell = findCellByLogicalColumn(rows.get(rowIndex), logicalColumn);
+            // 这里不是按“物理列序号”直接取 cell，
+            // 而是按逻辑列定位，再检查该列是否仍处于纵向合并的 continue 状态。
             if (!isVerticalMergeContinuation(cell)) {
                 break;
             }
@@ -785,6 +803,7 @@ public class DocxStyleService {
         int currentColumn = 0;
         for (XWPFTableCell cell : row.getTableCells()) {
             int span = getGridSpan(cell);
+            // 某些单元格可能横向合并了多列，所以这里用 gridSpan 把“视觉列号”映射回真实 cell。
             if (logicalColumn >= currentColumn && logicalColumn < currentColumn + span) {
                 return cell;
             }
@@ -794,7 +813,8 @@ public class DocxStyleService {
     }
 
     private int getGridSpan(XWPFTableCell cell) {
-        if (cell == null || cell.getCTTc() == null || cell.getCTTc().getTcPr() == null || cell.getCTTc().getTcPr().getGridSpan() == null) {
+        if (cell == null || cell.getCTTc() == null || cell.getCTTc().getTcPr() == null
+            || cell.getCTTc().getTcPr().getGridSpan() == null) {
             return 1;
         }
         return asInt(cell.getCTTc().getTcPr().getGridSpan().getVal(), 1);
@@ -819,6 +839,8 @@ public class DocxStyleService {
     private void formatTableCell(XWPFTableCell cell, TemplateStyleSet templateStyles, boolean headerRow) {
         for (IBodyElement bodyElement : cell.getBodyElements()) {
             if (bodyElement instanceof XWPFParagraph paragraph) {
+                // 单元格里的段落常常带有来源文档残留的边框、缩进、行距、run 直设格式。
+                // 这里先“去直设”，再统一回到模板样式，避免看起来像是样式复制失败。
                 clearParagraphBorders(paragraph);
                 trimLeadingWhitespace(paragraph);
                 paragraph.setSpacingBefore(0);
@@ -832,6 +854,7 @@ public class DocxStyleService {
                 continue;
             }
             if (bodyElement instanceof XWPFTable nestedTable) {
+                // 嵌套表格按同一套规则递归处理，否则外层表格正常、内层表格仍会保留旧格式。
                 formatTable(nestedTable, templateStyles, resolveAvailablePageWidth(nestedTable));
             }
         }
@@ -848,6 +871,8 @@ public class DocxStyleService {
         if (sectionProperties == null || sectionProperties.getPgSz() == null) {
             return 8266;
         }
+        // 可用宽度 = 页面宽度 - 左右页边距。
+        // 后续列宽分配不会直接用整页宽度，而是用这里算出来的内容区宽度。
         int pageWidth = asInt(sectionProperties.getPgSz().getW(), 11906);
         CTPageMar pageMargin = sectionProperties.getPgMar();
         int leftMargin = pageMargin == null ? 1800 : asInt(pageMargin.getLeft(), 1800);
@@ -857,37 +882,89 @@ public class DocxStyleService {
     }
 
     private void applyAutoFitWidth(XWPFTable table, int availablePageWidth) {
-        int columnCount = table.getRows().stream()
-                .filter(Objects::nonNull)
-                .mapToInt(row -> row.getTableCells().size())
-                .max()
-                .orElse(0);
+        int columnCount = resolvePreferredColumnCount(table);
         if (columnCount == 0) {
             return;
         }
         int[] contentUnits = new int[columnCount];
         for (XWPFTableRow row : table.getRows()) {
-            List<XWPFTableCell> cells = row.getTableCells();
-            for (int columnIndex = 0; columnIndex < cells.size(); columnIndex++) {
-                int cellUnits = estimateCellWidthUnits(cells.get(columnIndex));
-                contentUnits[columnIndex] = Math.max(contentUnits[columnIndex], cellUnits);
+            int logicalColumn = 0;
+            for (XWPFTableCell cell : row.getTableCells()) {
+                int span = Math.max(getGridSpan(cell), 1);
+                int cellUnits = estimateCellWidthUnits(cell);
+                // 合并单元格的内容不能只压到第一列，否则会把某一列权重拉得过大。
+                // 这里按跨度均摊到覆盖的逻辑列上，让首行合并表头对列宽估算更平滑。
+                int perColumnUnits = Math.max(4, (int) Math.ceil((double) cellUnits / span));
+                for (int offset = 0; offset < span && logicalColumn + offset < contentUnits.length; offset++) {
+                    // 同一列取“最宽内容”的估算值，避免某一行很短就把整列压得过窄。
+                    contentUnits[logicalColumn + offset] = Math.max(contentUnits[logicalColumn + offset], perColumnUnits);
+                }
+                logicalColumn += span;
             }
         }
 
         // 这里不是读取 Word 的真实渲染宽度，而是做一个启发式估算：
         // 文本越长、中文越多，列宽权重越大，再按页面可用宽度做比例分配。
         int[] widths = buildColumnWidths(contentUnits, availablePageWidth);
+        // Word 表格宽度通常要同时写 tblW、tblGrid、tcW 三层信息，
+        // 否则不同查看器里可能出现“表格总宽对了，但列宽没跟上”的情况。
         table.setWidth(Integer.toString(Math.min(sum(widths), availablePageWidth)));
         table.getCTTbl().getTblPr().addNewTblW().setType(STTblWidth.DXA);
         table.getCTTbl().getTblPr().getTblW().setW(BigInteger.valueOf(Math.min(sum(widths), availablePageWidth)));
         ensureTableGrid(table, widths);
 
         for (XWPFTableRow row : table.getRows()) {
-            List<XWPFTableCell> cells = row.getTableCells();
-            for (int columnIndex = 0; columnIndex < cells.size() && columnIndex < widths.length; columnIndex++) {
-                setCellWidth(cells.get(columnIndex), widths[columnIndex]);
+            int logicalColumn = 0;
+            for (XWPFTableCell cell : row.getTableCells()) {
+                int span = Math.max(getGridSpan(cell), 1);
+                setCellWidth(cell, sumWidths(widths, logicalColumn, span));
+                logicalColumn += span;
             }
         }
+    }
+
+    private int resolvePreferredColumnCount(XWPFTable table) {
+        List<XWPFTableRow> rows = table.getRows();
+        if (rows.isEmpty()) {
+            return 0;
+        }
+        XWPFTableRow firstRow = rows.get(0);
+        // 如果首行存在横向合并，常见情况是它只是大类表头，真实列结构在第二行。
+        // 这时优先参考第二行的逻辑列数，避免把整张表误判成“只有首行那几个大单元格”。
+        if (hasHorizontalMerge(firstRow) && rows.size() > 1) {
+            int secondRowColumns = countLogicalColumns(rows.get(1));
+            if (secondRowColumns > 0) {
+                return secondRowColumns;
+            }
+        }
+        return rows.stream()
+                .filter(Objects::nonNull)
+                .mapToInt(this::countLogicalColumns)
+                .max()
+                .orElse(0);
+    }
+
+    private boolean hasHorizontalMerge(XWPFTableRow row) {
+        if (row == null) {
+            return false;
+        }
+        for (XWPFTableCell cell : row.getTableCells()) {
+            if (getGridSpan(cell) > 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private int countLogicalColumns(XWPFTableRow row) {
+        if (row == null) {
+            return 0;
+        }
+        int total = 0;
+        for (XWPFTableCell cell : row.getTableCells()) {
+            total += Math.max(getGridSpan(cell), 1);
+        }
+        return total;
     }
 
     private int[] buildColumnWidths(int[] contentUnits, int availablePageWidth) {
@@ -897,6 +974,7 @@ public class DocxStyleService {
         int usableWidth = Math.max(availablePageWidth - paddingPerColumn * columnCount, minimumWidth * columnCount);
         int totalUnits = 0;
         for (int i = 0; i < contentUnits.length; i++) {
+            // 每列先给一个最小内容权重，避免空列被算成 0 宽。
             contentUnits[i] = Math.max(contentUnits[i], 4);
             totalUnits += contentUnits[i];
         }
@@ -904,12 +982,14 @@ public class DocxStyleService {
         int[] widths = new int[columnCount];
         int allocated = 0;
         for (int i = 0; i < columnCount; i++) {
+            // 第一轮按内容权重做比例分配，同时给每列预留固定 padding。
             int proportional = Math.max(minimumWidth, usableWidth * contentUnits[i] / Math.max(totalUnits, 1));
             widths[i] = proportional + paddingPerColumn;
             allocated += widths[i];
         }
 
         if (allocated > availablePageWidth) {
+            // 如果总宽超出页面，就按比例整体压缩，但仍保留最小列宽下限。
             double scale = (double) availablePageWidth / allocated;
             allocated = 0;
             for (int i = 0; i < columnCount; i++) {
@@ -919,6 +999,7 @@ public class DocxStyleService {
         }
 
         if (allocated < availablePageWidth) {
+            // 最后一列吃掉余量，避免因为整数除法导致表格右侧留出明显空白。
             widths[columnCount - 1] += availablePageWidth - allocated;
         }
         return widths;
@@ -939,6 +1020,9 @@ public class DocxStyleService {
         }
         int units = 0;
         for (char ch : text.toCharArray()) {
+            // 这里用一个很粗但稳定的估算：
+            // ASCII 按 1 单位，中文等宽字符按 2 单位，空白也算 1 单位。
+            // 目标不是精确排版，而是让中英文混排时列宽分配更接近肉眼观感。
             if (Character.isWhitespace(ch)) {
                 units += 1;
             } else if (ch <= 127) {
@@ -956,6 +1040,7 @@ public class DocxStyleService {
         } else {
             table.getCTTbl().getTblGrid().setGridColArray(null);
         }
+        // tblGrid 是“整张表的列定义”，可以理解成表格骨架。
         for (int width : widths) {
             table.getCTTbl().getTblGrid().addNewGridCol().setW(BigInteger.valueOf(width));
         }
@@ -968,8 +1053,17 @@ public class DocxStyleService {
         if (cell.getCTTc().getTcPr().getTcW() == null) {
             cell.getCTTc().getTcPr().addNewTcW();
         }
+        // tcW 是“单元格自己的宽度声明”，与 tblGrid 配合后兼容性更稳。
         cell.getCTTc().getTcPr().getTcW().setType(STTblWidth.DXA);
         cell.getCTTc().getTcPr().getTcW().setW(BigInteger.valueOf(width));
+    }
+
+    private int sumWidths(int[] widths, int startColumn, int span) {
+        int total = 0;
+        for (int index = 0; index < span && startColumn + index < widths.length; index++) {
+            total += widths[startColumn + index];
+        }
+        return total;
     }
 
     private int sum(int[] values) {
@@ -996,7 +1090,8 @@ public class DocxStyleService {
         return defaultValue;
     }
 
-    private void applyTemplateParagraphStyle(XWPFParagraph paragraph, Map<String, String> originalStyleNames, TemplateStyleSet templateStyles) {
+    private void applyTemplateParagraphStyle(XWPFParagraph paragraph, Map<String, String> originalStyleNames,
+        TemplateStyleSet templateStyles) {
         String styleId = resolveParagraphStyleId(paragraph, originalStyleNames, templateStyles);
         if (styleId == null || styleId.isBlank()) {
             styleId = templateStyles.normalStyleId();
@@ -1009,7 +1104,8 @@ public class DocxStyleService {
         paragraph.setStyle(styleId);
     }
 
-    private String resolveParagraphStyleId(XWPFParagraph paragraph, Map<String, String> originalStyleNames, TemplateStyleSet templateStyles) {
+    private String resolveParagraphStyleId(XWPFParagraph paragraph, Map<String, String> originalStyleNames,
+        TemplateStyleSet templateStyles) {
         String originalStyleId = paragraph.getStyle();
         String styleName = normalizeStyleName(originalStyleNames.get(originalStyleId));
         if (styleName != null) {
@@ -1068,8 +1164,8 @@ public class DocxStyleService {
             return false;
         }
         return styleId.equals(templateStyles.heading1StyleId())
-                || styleId.equals(templateStyles.heading2StyleId())
-                || styleId.equals(templateStyles.heading3StyleId());
+            || styleId.equals(templateStyles.heading2StyleId())
+            || styleId.equals(templateStyles.heading3StyleId());
     }
 
     private void clearDirectParagraphNumbering(XWPFParagraph paragraph) {
@@ -1164,14 +1260,14 @@ public class DocxStyleService {
             String heading2StyleId = findOptionalStyleId(styleIdByName, "heading 2");
             String heading3StyleId = findOptionalStyleId(styleIdByName, "heading 3");
             return new TemplateStyleSet(
-                    styleIdByName,
-                    normalStyleId,
-                    tableHeaderStyleId,
-                    tableBodyStyleId,
-                    titleStyleId,
-                    heading1StyleId,
-                    heading2StyleId,
-                    heading3StyleId
+                styleIdByName,
+                normalStyleId,
+                tableHeaderStyleId,
+                tableBodyStyleId,
+                titleStyleId,
+                heading1StyleId,
+                heading2StyleId,
+                heading3StyleId
             );
         } catch (Exception ex) {
             throw new IOException("读取模板样式失败", ex);
@@ -1198,24 +1294,26 @@ public class DocxStyleService {
         }
     }
 
-    private Map<String, Style> collectStyles(StyleDefinitionsPart stylePart, Set<String> styleNames, boolean includeDependencies) {
+    private Map<String, Style> collectStyles(StyleDefinitionsPart stylePart, Set<String> styleNames,
+        boolean includeDependencies) {
         Map<String, Style> collector = new LinkedHashMap<>();
         for (String name : styleNames) {
             Style style = findStyle(stylePart, name)
-                    .orElseThrow(() -> new IllegalArgumentException("找不到样式:" + name));
+                .orElseThrow(() -> new IllegalArgumentException("找不到样式:" + name));
             addStyleWithDependencies(stylePart, collector, style, includeDependencies);
         }
         return collector;
     }
 
-    private void addStyleWithDependencies(StyleDefinitionsPart part, Map<String, Style> collector, Style style, boolean includeDependencies) {
+    private void addStyleWithDependencies(StyleDefinitionsPart part, Map<String, Style> collector, Style style,
+        boolean includeDependencies) {
         if (collector.containsKey(style.getStyleId())) {
             return;
         }
         collector.put(style.getStyleId(), XmlUtils.deepCopy(style));
         if (includeDependencies && style.getBasedOn() != null && style.getBasedOn().getVal() != null) {
             findStyle(part, style.getBasedOn().getVal())
-                    .ifPresent(parent -> addStyleWithDependencies(part, collector, parent, true));
+                .ifPresent(parent -> addStyleWithDependencies(part, collector, parent, true));
         }
     }
 
@@ -1275,9 +1373,12 @@ public class DocxStyleService {
     private void normalizeImageLayout(Path docxPath) throws IOException {
         Path temp = Files.createTempFile("docx-image-layout-", ".docx");
         try (ZipInputStream zipIn = new ZipInputStream(Files.newInputStream(docxPath));
-             ZipOutputStream zipOut = new ZipOutputStream(Files.newOutputStream(temp))) {
+            ZipOutputStream zipOut = new ZipOutputStream(Files.newOutputStream(temp))) {
             // docx 本质上是 zip 包。
             // 这里直接改写内部 XML，把图片布局统一成更可控的 anchor 形式。
+            // 学习点：
+            // 1. Word 里的图片如果是 wp:inline，表示“嵌入文字行内”，通常不能做环绕。
+            // 2. 想要“四周环绕型”，通常要改成 wp:anchor，并补上 wrapSquare / positionH / positionV 等节点。
             ZipEntry entry;
             while ((entry = zipIn.getNextEntry()) != null) {
                 byte[] content = zipIn.readAllBytes();
@@ -1300,10 +1401,10 @@ public class DocxStyleService {
             return false;
         }
         return "word/document.xml".equals(entryName)
-                || entryName.matches("word/header\\d+\\.xml")
-                || entryName.matches("word/footer\\d+\\.xml")
-                || "word/footnotes.xml".equals(entryName)
-                || "word/endnotes.xml".equals(entryName);
+            || entryName.matches("word/header\\d+\\.xml")
+            || entryName.matches("word/footer\\d+\\.xml")
+            || "word/footnotes.xml".equals(entryName)
+            || "word/endnotes.xml".equals(entryName);
     }
 
     private byte[] rewriteImageLayoutXml(byte[] xmlBytes) throws IOException {
@@ -1312,6 +1413,9 @@ public class DocxStyleService {
             factory.setNamespaceAware(true);
             factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
             Document document = factory.newDocumentBuilder().parse(new ByteArrayInputStream(xmlBytes));
+            // 分两步做归一化：
+            // 1. inline 图片转成 anchor。
+            // 2. 已经是 anchor 的图片也重新生成一次，覆盖掉来源文档中不一致的定位参数。
             boolean changed = normalizeInlinePictures(document);
             changed |= normalizeAnchoredPictures(document);
             if (!changed) {
@@ -1340,6 +1444,7 @@ public class DocxStyleService {
             }
         }
         for (Element inline : inlineElements) {
+            // inline -> anchor：这是把“行内图片”变成“可环绕浮动图片”的关键一步。
             Element anchor = buildStandardAnchor(document, inline, false);
             inline.getParentNode().replaceChild(anchor, inline);
         }
@@ -1356,6 +1461,7 @@ public class DocxStyleService {
             }
         }
         for (Element anchor : anchorElements) {
+            // 已有 anchor 也要标准化，避免原文档残留其它环绕方式、偏移量、层级参数。
             Element normalized = buildStandardAnchor(document, anchor, true);
             anchor.getParentNode().replaceChild(normalized, anchor);
         }
@@ -1364,6 +1470,10 @@ public class DocxStyleService {
 
     private Element buildStandardAnchor(Document document, Element source, boolean preserveHorizontalPosition) {
         // 统一生成一套固定 anchor 结构，减少不同来源文档带来的布局漂移。
+        // 可以把这里理解成在拼 Word 的“图片版式面板”：
+        // - positionH / positionV：水平、垂直定位
+        // - wrapSquare：四周环绕
+        // - extent / graphic：图片尺寸与图形本体
         Element anchor = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:anchor");
         anchor.setAttribute("distT", "0");
         anchor.setAttribute("distB", "0");
@@ -1399,6 +1509,7 @@ public class DocxStyleService {
         if (preserveHorizontalPosition) {
             Element existing = findDirectChild(source, "positionH");
             if (existing != null) {
+                // 水平位置允许沿用旧值，避免把用户原本左右摆放好的图片全部强制吸到同一列。
                 return (Element) document.importNode(existing, true);
             }
         }
@@ -1412,6 +1523,8 @@ public class DocxStyleService {
 
     private Element createVerticalPosition(Document document) {
         Element positionV = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:positionV");
+        // relativeFrom="page" + posOffset=0
+        // 对应 Word UI 里常见的“垂直：相对于页面，绝对位置 0”。
         positionV.setAttribute("relativeFrom", "page");
         Element posOffset = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:posOffset");
         posOffset.setTextContent("0");
@@ -1421,6 +1534,7 @@ public class DocxStyleService {
 
     private Element createWrapSquare(Document document) {
         Element wrapSquare = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:wrapSquare");
+        // wrapText="bothSides" 对应“四周环绕”，文字会在图片左右两侧绕排。
         wrapSquare.setAttribute("wrapText", "bothSides");
         return wrapSquare;
     }
@@ -1439,8 +1553,8 @@ public class DocxStyleService {
         Node child = parent.getFirstChild();
         while (child != null) {
             if (child instanceof Element element
-                    && WORDPROCESSING_DRAWING_NS.equals(element.getNamespaceURI())
-                    && localName.equals(element.getLocalName())) {
+                && WORDPROCESSING_DRAWING_NS.equals(element.getNamespaceURI())
+                && localName.equals(element.getLocalName())) {
                 return element;
             }
             child = child.getNextSibling();
@@ -1485,8 +1599,8 @@ public class DocxStyleService {
 
     private void convertDocToDocx(Path docPath, Path docxPath) throws IOException {
         try (InputStream in = Files.newInputStream(docPath);
-             HWPFDocument hwpf = new HWPFDocument(in);
-             XWPFDocument xwpf = new XWPFDocument()) {
+            HWPFDocument hwpf = new HWPFDocument(in);
+            XWPFDocument xwpf = new XWPFDocument()) {
             buildParagraphs(hwpf, xwpf);
             try (OutputStream out = Files.newOutputStream(docxPath)) {
                 xwpf.write(out);
@@ -1509,7 +1623,8 @@ public class DocxStyleService {
             Table currentTable = null;
             if (tableIndex < tables.size()) {
                 Table candidate = tables.get(tableIndex);
-                if (paragraph.getStartOffset() >= candidate.getStartOffset() && paragraph.getEndOffset() <= candidate.getEndOffset()) {
+                if (paragraph.getStartOffset() >= candidate.getStartOffset()
+                    && paragraph.getEndOffset() <= candidate.getEndOffset()) {
                     currentTable = candidate;
                 }
             }
@@ -1556,8 +1671,8 @@ public class DocxStyleService {
         for (int rowIndex = 0; rowIndex < table.numRows(); rowIndex++) {
             TableRow row = table.getRow(rowIndex);
             XWPFTableRow xRow = rowIndex == 0 && xTable.getNumberOfRows() == 1
-                    ? xTable.getRow(0)
-                    : xTable.createRow();
+                ? xTable.getRow(0)
+                : xTable.createRow();
             ensureCellCount(xRow, row.numCells());
             for (int cellIndex = 0; cellIndex < row.numCells(); cellIndex++) {
                 TableCell cell = row.getCell(cellIndex);
@@ -1600,6 +1715,7 @@ public class DocxStyleService {
     }
 
     private Path finalizeTarget(ConvertedFile converted, Path userTarget) throws IOException {
+        normalizeImageLayout(converted.effectivePath);
         if (converted.copyBackToOriginal) {
             if (!converted.effectivePath.equals(userTarget)) {
                 Files.copy(converted.effectivePath, userTarget, StandardCopyOption.REPLACE_EXISTING);
@@ -1615,9 +1731,9 @@ public class DocxStyleService {
 
     private Set<String> normalizeStyleKeys(Set<String> styleNames) {
         return styleNames.stream()
-                .map(name -> name == null ? "" : name.trim().toLowerCase(Locale.ROOT))
-                .filter(token -> !token.isEmpty())
-                .collect(Collectors.toCollection(LinkedHashSet::new));
+            .map(name -> name == null ? "" : name.trim().toLowerCase(Locale.ROOT))
+            .filter(token -> !token.isEmpty())
+            .collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
     private boolean shouldRemoveStyle(Style style, Set<String> normalizedKeys) {
@@ -1651,26 +1767,31 @@ public class DocxStyleService {
     }
 
     public record StyleInfo(String styleId, String name, String type) {
+
     }
 
     public record CleanResult(Path file, int removed) {
+
     }
 
     private record ConvertedFile(Path originalPath, Path effectivePath, boolean copyBackToOriginal) {
+
     }
 
     private record TemplateStyleSet(
-            Map<String, String> styleIdByName,
-            String normalStyleId,
-            String tableHeaderStyleId,
-            String tableBodyStyleId,
-            String titleStyleId,
-            String heading1StyleId,
-            String heading2StyleId,
-            String heading3StyleId
+        Map<String, String> styleIdByName,
+        String normalStyleId,
+        String tableHeaderStyleId,
+        String tableBodyStyleId,
+        String titleStyleId,
+        String heading1StyleId,
+        String heading2StyleId,
+        String heading3StyleId
     ) {
+
     }
 
     private record MarkdownNumbering(BigInteger bulletNumId, BigInteger orderedNumId) {
+
     }
 }

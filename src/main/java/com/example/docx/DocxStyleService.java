@@ -10,9 +10,11 @@ import org.apache.poi.hwpf.usermodel.TableCell;
 import org.apache.poi.hwpf.usermodel.TableIterator;
 import org.apache.poi.hwpf.usermodel.TableRow;
 import org.apache.poi.xwpf.usermodel.ParagraphAlignment;
+import org.apache.poi.xwpf.usermodel.XWPFAbstractNum;
 import org.apache.poi.xwpf.usermodel.TableRowAlign;
 import org.apache.poi.xwpf.usermodel.UnderlinePatterns;
 import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import org.apache.poi.xwpf.usermodel.XWPFNumbering;
 import org.apache.poi.xwpf.usermodel.XWPFParagraph;
 import org.apache.poi.xwpf.usermodel.XWPFRun;
 import org.apache.poi.xwpf.usermodel.XWPFTable;
@@ -27,12 +29,26 @@ import org.docx4j.openpackaging.parts.WordprocessingML.StyleDefinitionsPart;
 import org.docx4j.wml.Style;
 import org.docx4j.wml.Styles;
 import org.docx4j.XmlUtils;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTAbstractNum;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTNumPr;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTPageMar;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTPPr;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTPPrGeneral;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTSectPr;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTcPr;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTblPr;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTInd;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTLvl;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.STJc;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.STNumberFormat;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STTblWidth;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
 import java.io.BufferedWriter;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -52,12 +68,38 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import java.util.zip.ZipOutputStream;
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.transform.OutputKeys;
+import javax.xml.transform.Transformer;
+import javax.xml.transform.TransformerFactory;
+import javax.xml.transform.dom.DOMSource;
+import javax.xml.transform.stream.StreamResult;
 
 /**
- * 提供样式迁移、导出与清理的核心服务。
+ * 提供样式迁移、导出、清理与文档格式化的核心服务。
+ *
+ * <p>这个类同时用到了两套 Word 处理库：</p>
+ * <p>1. docx4j：更适合直接复制/删除样式、编号等底层定义。</p>
+ * <p>2. Apache POI：更适合遍历段落、表格、run，并按模板重排内容。</p>
+ *
+ * <p>因此可以把这个类理解成两层：</p>
+ * <p>1. “样式定义层”负责迁移 styles.xml、numbering.xml 这类结构。</p>
+ * <p>2. “内容格式层”负责把段落、表格、Markdown 渲染成目标模板的视觉效果。</p>
  */
 public class DocxStyleService {
+    private static final String WORDPROCESSING_DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+    private static final Pattern MARKDOWN_HEADING = Pattern.compile("^(#{1,6})\\s+(.*)$");
+    private static final Pattern MARKDOWN_BULLET = Pattern.compile("^(\\s*)[-+*]\\s+(.*)$");
+    private static final Pattern MARKDOWN_ORDERED = Pattern.compile("^(\\s*)(\\d+)\\.\\s+(.*)$");
+    private static final Pattern MARKDOWN_TABLE_SEPARATOR = Pattern.compile("^\\s*\\|?(\\s*:?-{3,}:?\\s*\\|)+\\s*:?-{3,}:?\\s*\\|?\\s*$");
+    private static final Pattern MARKDOWN_INLINE = Pattern.compile("(\\*\\*[^*]+\\*\\*|__[^_]+__|`[^`]+`|\\*[^*]+\\*|_[^_]+_)");
 
     public Path migrate(Path source, Path target, Set<String> styleNames, boolean copyNumbering, boolean includeDependencies) throws Exception {
         List<Path> tempFiles = new ArrayList<>();
@@ -112,14 +154,32 @@ public class DocxStyleService {
         List<Path> tempFiles = new ArrayList<>();
         ConvertedFile target = ensureDocx(document, tempFiles, false);
         try {
+            // 先抽取内置模板，再把模板中的样式定义整体复制到目标文档，
+            // 最后基于“原始段落样式名 -> 模板样式 ID”的映射逐段重设格式。
             Path template = extractBuiltinTemplate(tempFiles);
             Map<String, String> originalStyleNames = readParagraphStyleNames(target.effectivePath);
             TemplateStyleSet templateStyles = loadTemplateStyleSet(template);
-            transferAllStyles(template, target.effectivePath, false);
-            applyDocumentFormat(target.effectivePath, originalStyleNames, templateStyles);
+            transferAllStyles(template, target.effectivePath, true);
+            applyDocumentFormat(target.effectivePath, template, originalStyleNames, templateStyles);
             return finalizeTarget(target, document);
         } finally {
             cleanupTemps(tempFiles);
+        }
+    }
+
+    public Path convertMarkdown(Path markdownFile, Path templatePath, String documentTitle) throws Exception {
+        String markdown = Files.readString(markdownFile, StandardCharsets.UTF_8);
+        try (InputStream templateIn = Files.newInputStream(templatePath);
+             XWPFDocument document = new XWPFDocument(templateIn)) {
+            // Markdown 转换不是“纯文本导出”，而是借用模板文档作为样式容器，
+            // 这样生成后的标题、正文、表格会直接落到模板已有样式上。
+            TemplateStyleSet templateStyles = loadTemplateStyleSet(templatePath);
+            renderMarkdownDocument(document, markdown, documentTitle, templateStyles);
+            Path output = Files.createTempFile("markdown-convert-", ".docx");
+            try (OutputStream out = Files.newOutputStream(output)) {
+                document.write(out);
+            }
+            return output;
         }
     }
 
@@ -231,25 +291,440 @@ public class DocxStyleService {
         return removed;
     }
 
-    private void applyDocumentFormat(Path docxPath, Map<String, String> originalStyleNames, TemplateStyleSet templateStyles) throws IOException {
+    private void applyDocumentFormat(Path docxPath,
+                                     Path templatePath,
+                                     Map<String, String> originalStyleNames,
+                                     TemplateStyleSet templateStyles) throws IOException {
         try (InputStream in = Files.newInputStream(docxPath);
-             XWPFDocument document = new XWPFDocument(in)) {
+             InputStream templateIn = Files.newInputStream(templatePath);
+             XWPFDocument document = new XWPFDocument(in);
+             XWPFDocument templateDocument = new XWPFDocument(templateIn)) {
+            applyTemplateSectionProperties(document, templateDocument);
             formatBodyElements(document.getBodyElements(), originalStyleNames, templateStyles, false);
             try (OutputStream out = Files.newOutputStream(docxPath)) {
                 document.write(out);
             }
         }
+        normalizeImageLayout(docxPath);
+    }
+
+    private void applyTemplateSectionProperties(XWPFDocument document, XWPFDocument templateDocument) {
+        CTSectPr templateSectPr = templateDocument.getDocument().getBody().getSectPr();
+        if (templateSectPr == null) {
+            return;
+        }
+        document.getDocument().getBody().setSectPr((CTSectPr) templateSectPr.copy());
+    }
+
+    private void renderMarkdownDocument(XWPFDocument document,
+                                        String markdown,
+                                        String documentTitle,
+                                        TemplateStyleSet templateStyles) {
+        // 这里是一个很直接的“按行扫描”状态机：
+        // 依次识别代码块、标题、表格、列表、引用和普通段落，
+        // 每识别出一种块级结构，就把对应内容追加到 Word 文档中。
+        clearDocumentBody(document);
+        MarkdownNumbering numbering = ensureMarkdownNumbering(document);
+
+        List<String> lines = normalizeMarkdown(markdown);
+        boolean titleWritten = false;
+        if (documentTitle != null && !documentTitle.isBlank()) {
+            appendStyledParagraph(document, documentTitle.trim(), resolveTitleStyleId(templateStyles), false);
+            titleWritten = true;
+        }
+
+        for (int index = 0; index < lines.size(); ) {
+            String line = lines.get(index);
+            if (line.isBlank()) {
+                index++;
+                continue;
+            }
+
+            if (isFenceStart(line)) {
+                index = appendCodeBlock(document, lines, index, templateStyles);
+                continue;
+            }
+
+            Matcher headingMatcher = MARKDOWN_HEADING.matcher(line);
+            if (headingMatcher.matches()) {
+                int level = headingMatcher.group(1).length();
+                String text = headingMatcher.group(2).trim();
+                boolean useTitle = level == 1 && !titleWritten;
+                appendStyledParagraph(document, text, resolveHeadingStyleId(level, useTitle, templateStyles), false);
+                titleWritten = titleWritten || useTitle;
+                index++;
+                continue;
+            }
+
+            if (isTableBlock(lines, index)) {
+                index = appendTableBlock(document, lines, index, templateStyles);
+                continue;
+            }
+
+            if (isListLine(line)) {
+                index = appendListBlock(document, lines, index, templateStyles, numbering);
+                continue;
+            }
+
+            if (line.trim().startsWith(">")) {
+                index = appendQuoteBlock(document, lines, index, templateStyles);
+                continue;
+            }
+
+            index = appendParagraphBlock(document, lines, index, templateStyles);
+        }
+
+        if (document.getBodyElements().isEmpty()) {
+            appendStyledParagraph(document, "", templateStyles.normalStyleId(), true);
+        }
+    }
+
+    private void clearDocumentBody(XWPFDocument document) {
+        while (!document.getBodyElements().isEmpty()) {
+            document.removeBodyElement(0);
+        }
+    }
+
+    private List<String> normalizeMarkdown(String markdown) {
+        String normalized = markdown == null ? "" : markdown.replace("\r\n", "\n").replace('\r', '\n');
+        return Arrays.asList(normalized.split("\n", -1));
+    }
+
+    private boolean isFenceStart(String line) {
+        return line != null && line.trim().startsWith("```");
+    }
+
+    private int appendCodeBlock(XWPFDocument document, List<String> lines, int startIndex, TemplateStyleSet templateStyles) {
+        int index = startIndex + 1;
+        while (index < lines.size() && !isFenceStart(lines.get(index))) {
+            // 代码块不依赖模板中的专用“代码样式”，而是先使用正文段落，
+            // 再通过 run 的等宽字体覆盖实现一个稳定的兜底效果。
+            XWPFParagraph paragraph = createStyledParagraph(document, templateStyles.normalStyleId(), false);
+            paragraph.setAlignment(ParagraphAlignment.LEFT);
+            for (XWPFRun run : paragraph.getRuns()) {
+                run.setFontFamily("Courier New");
+            }
+            XWPFRun run = paragraph.createRun();
+            run.setFontFamily("Courier New");
+            run.setText(lines.get(index));
+            index++;
+        }
+        return index < lines.size() ? index + 1 : index;
+    }
+
+    private boolean isTableBlock(List<String> lines, int index) {
+        if (index + 1 >= lines.size()) {
+            return false;
+        }
+        return looksLikeTableRow(lines.get(index)) && MARKDOWN_TABLE_SEPARATOR.matcher(lines.get(index + 1)).matches();
+    }
+
+    private boolean looksLikeTableRow(String line) {
+        if (line == null || line.isBlank()) {
+            return false;
+        }
+        int pipeCount = 0;
+        for (char ch : line.toCharArray()) {
+            if (ch == '|') {
+                pipeCount++;
+            }
+        }
+        return pipeCount >= 1;
+    }
+
+    private int appendTableBlock(XWPFDocument document, List<String> lines, int startIndex, TemplateStyleSet templateStyles) {
+        List<List<String>> rows = new ArrayList<>();
+        rows.add(parseTableRow(lines.get(startIndex)));
+        int index = startIndex + 2;
+        while (index < lines.size() && looksLikeTableRow(lines.get(index)) && !lines.get(index).isBlank()) {
+            rows.add(parseTableRow(lines.get(index)));
+            index++;
+        }
+
+        int columnCount = rows.stream().mapToInt(List::size).max().orElse(1);
+        XWPFTable table = document.createTable(Math.max(rows.size(), 1), columnCount);
+        for (int rowIndex = 0; rowIndex < rows.size(); rowIndex++) {
+            XWPFTableRow row = table.getRow(rowIndex);
+            ensureCellCount(row, columnCount);
+            List<String> cells = rows.get(rowIndex);
+            for (int columnIndex = 0; columnIndex < columnCount; columnIndex++) {
+                String cellText = columnIndex < cells.size() ? cells.get(columnIndex) : "";
+                XWPFTableCell cell = row.getCell(columnIndex);
+                if (cell.getParagraphs().isEmpty()) {
+                    cell.addParagraph();
+                }
+                XWPFParagraph paragraph = cell.getParagraphs().get(0);
+                clearParagraphContent(paragraph);
+                appendInlineRuns(paragraph, cellText);
+                for (int extra = cell.getParagraphs().size() - 1; extra >= 1; extra--) {
+                    cell.removeParagraph(extra);
+                }
+            }
+        }
+        formatTable(table, templateStyles, resolveAvailablePageWidth(table));
+        return index;
+    }
+
+    private List<String> parseTableRow(String line) {
+        String normalized = line == null ? "" : line.trim();
+        if (normalized.startsWith("|")) {
+            normalized = normalized.substring(1);
+        }
+        if (normalized.endsWith("|")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        String[] parts = normalized.split("\\|", -1);
+        List<String> cells = new ArrayList<>(parts.length);
+        for (String part : parts) {
+            cells.add(part.trim());
+        }
+        return cells;
+    }
+
+    private boolean isListLine(String line) {
+        return MARKDOWN_BULLET.matcher(line).matches() || MARKDOWN_ORDERED.matcher(line).matches();
+    }
+
+    private int appendListBlock(XWPFDocument document,
+                                List<String> lines,
+                                int startIndex,
+                                TemplateStyleSet templateStyles,
+                                MarkdownNumbering numbering) {
+        int index = startIndex;
+        while (index < lines.size() && isListLine(lines.get(index))) {
+            String line = lines.get(index);
+            Matcher ordered = MARKDOWN_ORDERED.matcher(line);
+            boolean orderedList = ordered.matches();
+            String leadingWhitespace;
+            String text;
+            if (orderedList) {
+                leadingWhitespace = ordered.group(1);
+                text = ordered.group(3).trim();
+            } else {
+                Matcher bullet = MARKDOWN_BULLET.matcher(line);
+                bullet.matches();
+                leadingWhitespace = bullet.group(1);
+                text = bullet.group(2).trim();
+            }
+            XWPFParagraph paragraph = createStyledParagraph(document, templateStyles.normalStyleId(), false);
+            paragraph.setAlignment(ParagraphAlignment.LEFT);
+            // Markdown 列表最终仍要落到 Word 的编号体系里。
+            // 这里通过 numId + ilvl 控制“是有序/无序列表”以及“缩进层级”。
+            applyListNumbering(
+                    paragraph,
+                    orderedList ? numbering.orderedNumId() : numbering.bulletNumId(),
+                    resolveListLevel(leadingWhitespace)
+            );
+            appendInlineRuns(paragraph, text);
+            index++;
+        }
+        return index;
+    }
+
+    private MarkdownNumbering ensureMarkdownNumbering(XWPFDocument document) {
+        XWPFNumbering numbering = document.getNumbering();
+        if (numbering == null) {
+            numbering = document.createNumbering();
+        }
+        BigInteger bulletAbstractNumId = numbering.addAbstractNum(new XWPFAbstractNum(createListAbstractNum(false)));
+        BigInteger bulletNumId = numbering.addNum(bulletAbstractNumId);
+        BigInteger orderedAbstractNumId = numbering.addAbstractNum(new XWPFAbstractNum(createListAbstractNum(true)));
+        BigInteger orderedNumId = numbering.addNum(orderedAbstractNumId);
+        return new MarkdownNumbering(bulletNumId, orderedNumId);
+    }
+
+    private CTAbstractNum createListAbstractNum(boolean ordered) {
+        CTAbstractNum abstractNum = CTAbstractNum.Factory.newInstance();
+        abstractNum.setAbstractNumId(BigInteger.ZERO);
+        for (int level = 0; level < 9; level++) {
+            // Word 最多常见支持 9 级列表，这里预先一次性建好。
+            CTLvl lvl = abstractNum.addNewLvl();
+            lvl.setIlvl(BigInteger.valueOf(level));
+            lvl.addNewStart().setVal(BigInteger.ONE);
+            lvl.addNewNumFmt().setVal(ordered ? STNumberFormat.DECIMAL : STNumberFormat.BULLET);
+            lvl.addNewLvlText().setVal(ordered ? "%" + (level + 1) + "." : "\u2022");
+            lvl.addNewLvlJc().setVal(STJc.LEFT);
+            CTPPrGeneral ppr = lvl.addNewPPr();
+            CTInd ind = ppr.addNewInd();
+            ind.setLeft(BigInteger.valueOf(720L * (level + 1)));
+            ind.setHanging(BigInteger.valueOf(360));
+        }
+        return abstractNum;
+    }
+
+    private void applyListNumbering(XWPFParagraph paragraph, BigInteger numId, int level) {
+        paragraph.setNumID(numId);
+        paragraph.setIndentationFirstLine(0);
+        paragraph.setIndentationLeft(720 * (level + 1));
+        paragraph.setIndentationHanging(360);
+
+        CTPPr ppr = paragraph.getCTP().isSetPPr() ? paragraph.getCTP().getPPr() : paragraph.getCTP().addNewPPr();
+        CTNumPr numPr = ppr.isSetNumPr() ? ppr.getNumPr() : ppr.addNewNumPr();
+        if (!numPr.isSetNumId()) {
+            numPr.addNewNumId();
+        }
+        numPr.getNumId().setVal(numId);
+        if (!numPr.isSetIlvl()) {
+            numPr.addNewIlvl();
+        }
+        numPr.getIlvl().setVal(BigInteger.valueOf(level));
+    }
+
+    private int resolveListLevel(String leadingWhitespace) {
+        if (leadingWhitespace == null || leadingWhitespace.isEmpty()) {
+            return 0;
+        }
+        int spaces = 0;
+        for (char ch : leadingWhitespace.toCharArray()) {
+            if (ch == '\t') {
+                spaces += 4;
+            } else if (ch == ' ') {
+                spaces++;
+            }
+        }
+        return Math.min(spaces / 2, 8);
+    }
+
+    private int appendQuoteBlock(XWPFDocument document, List<String> lines, int startIndex, TemplateStyleSet templateStyles) {
+        StringBuilder builder = new StringBuilder();
+        int index = startIndex;
+        while (index < lines.size()) {
+            String line = lines.get(index);
+            if (line.isBlank() || !line.trim().startsWith(">")) {
+                break;
+            }
+            if (!builder.isEmpty()) {
+                builder.append(' ');
+            }
+            builder.append(line.trim().substring(1).trim());
+            index++;
+        }
+        XWPFParagraph paragraph = createStyledParagraph(document, templateStyles.normalStyleId(), false);
+        paragraph.setAlignment(ParagraphAlignment.LEFT);
+        XWPFRun prefixRun = paragraph.createRun();
+        prefixRun.setItalic(true);
+        prefixRun.setText("引用：");
+        appendInlineRuns(paragraph, builder.toString());
+        return index;
+    }
+
+    private int appendParagraphBlock(XWPFDocument document, List<String> lines, int startIndex, TemplateStyleSet templateStyles) {
+        StringBuilder builder = new StringBuilder();
+        int index = startIndex;
+        while (index < lines.size()) {
+            String line = lines.get(index);
+            if (line.isBlank() || isFenceStart(line) || isTableBlock(lines, index) || isListLine(line) || line.trim().startsWith(">")) {
+                break;
+            }
+            if (MARKDOWN_HEADING.matcher(line).matches()) {
+                break;
+            }
+            if (!builder.isEmpty()) {
+                builder.append(' ');
+            }
+            builder.append(line.trim());
+            index++;
+        }
+        appendStyledParagraph(document, builder.toString(), templateStyles.normalStyleId(), true);
+        return index;
+    }
+
+    private void appendStyledParagraph(XWPFDocument document, String text, String styleId, boolean firstLineIndent) {
+        XWPFParagraph paragraph = createStyledParagraph(document, styleId, firstLineIndent);
+        appendInlineRuns(paragraph, text);
+    }
+
+    private XWPFParagraph createStyledParagraph(XWPFDocument document, String styleId, boolean firstLineIndent) {
+        XWPFParagraph paragraph = document.createParagraph();
+        if (styleId != null && !styleId.isBlank()) {
+            paragraph.setStyle(styleId);
+        }
+        if (!firstLineIndent) {
+            paragraph.setIndentationFirstLine(0);
+        }
+        return paragraph;
+    }
+
+    private void appendInlineRuns(XWPFParagraph paragraph, String text) {
+        if (text == null || text.isEmpty()) {
+            if (paragraph.getRuns().isEmpty()) {
+                paragraph.createRun().setText("");
+            }
+            return;
+        }
+
+        // 这里只处理一小部分常见行内语法，目标是“够用且稳定”，
+        // 不是完整 Markdown 解析器。
+        Matcher matcher = MARKDOWN_INLINE.matcher(text);
+        int cursor = 0;
+        while (matcher.find()) {
+            if (matcher.start() > cursor) {
+                paragraph.createRun().setText(text.substring(cursor, matcher.start()));
+            }
+            String token = matcher.group();
+            if (token.startsWith("**") || token.startsWith("__")) {
+                XWPFRun run = paragraph.createRun();
+                run.setBold(true);
+                run.setText(token.substring(2, token.length() - 2));
+            } else if (token.startsWith("`")) {
+                XWPFRun run = paragraph.createRun();
+                run.setFontFamily("Courier New");
+                run.setText(token.substring(1, token.length() - 1));
+            } else {
+                XWPFRun run = paragraph.createRun();
+                run.setItalic(true);
+                run.setText(token.substring(1, token.length() - 1));
+            }
+            cursor = matcher.end();
+        }
+        if (cursor < text.length()) {
+            paragraph.createRun().setText(text.substring(cursor));
+        }
+    }
+
+    private void clearParagraphContent(XWPFParagraph paragraph) {
+        for (int index = paragraph.getRuns().size() - 1; index >= 0; index--) {
+            paragraph.removeRun(index);
+        }
+    }
+
+    private String resolveTitleStyleId(TemplateStyleSet templateStyles) {
+        if (templateStyles.titleStyleId() != null && !templateStyles.titleStyleId().isBlank()) {
+            return templateStyles.titleStyleId();
+        }
+        if (templateStyles.heading1StyleId() != null && !templateStyles.heading1StyleId().isBlank()) {
+            return templateStyles.heading1StyleId();
+        }
+        return templateStyles.normalStyleId();
+    }
+
+    private String resolveHeadingStyleId(int level, boolean title, TemplateStyleSet templateStyles) {
+        if (title) {
+            return resolveTitleStyleId(templateStyles);
+        }
+        if (level <= 2 && templateStyles.heading1StyleId() != null && !templateStyles.heading1StyleId().isBlank()) {
+            return templateStyles.heading1StyleId();
+        }
+        if (level == 3 && templateStyles.heading2StyleId() != null && !templateStyles.heading2StyleId().isBlank()) {
+            return templateStyles.heading2StyleId();
+        }
+        if (level >= 4 && templateStyles.heading3StyleId() != null && !templateStyles.heading3StyleId().isBlank()) {
+            return templateStyles.heading3StyleId();
+        }
+        return templateStyles.normalStyleId();
     }
 
     private void formatBodyElements(List<IBodyElement> bodyElements, Map<String, String> originalStyleNames, TemplateStyleSet templateStyles, boolean inTable) {
         for (IBodyElement bodyElement : bodyElements) {
             if (bodyElement instanceof XWPFParagraph paragraph) {
                 if (!inTable) {
+                    // 普通段落根据原文样式名重新映射到模板样式。
                     applyTemplateParagraphStyle(paragraph, originalStyleNames, templateStyles);
                 }
                 continue;
             }
             if (bodyElement instanceof XWPFTable table) {
+                // 表格不只改表框，还会递归处理单元格内段落和嵌套表格。
                 formatTable(table, templateStyles, resolveAvailablePageWidth(bodyElement));
             }
         }
@@ -283,6 +758,8 @@ public class DocxStyleService {
             return 0;
         }
         int headerRowCount = 1;
+        // 第一行如果存在纵向合并，表头在视觉上可能跨多行，
+        // 所以这里不是简单返回 1，而是顺着 vertical merge 继续探测。
         int logicalColumn = 0;
         for (XWPFTableCell cell : rows.get(0).getTableCells()) {
             int span = getGridSpan(cell);
@@ -348,12 +825,9 @@ public class DocxStyleService {
                 paragraph.setSpacingAfter(0);
                 paragraph.setSpacingBetween(1.0d);
                 paragraph.setIndentationFirstLine(0);
-                paragraph.setAlignment(ParagraphAlignment.CENTER);
                 paragraph.setStyle(headerRow ? templateStyles.tableHeaderStyleId() : templateStyles.tableBodyStyleId());
                 for (XWPFRun run : paragraph.getRuns()) {
-                    run.setFontFamily("宋体");
-                    run.setFontSize(12);
-                    run.setBold(headerRow);
+                    clearRunDirectFormatting(run);
                 }
                 continue;
             }
@@ -400,6 +874,8 @@ public class DocxStyleService {
             }
         }
 
+        // 这里不是读取 Word 的真实渲染宽度，而是做一个启发式估算：
+        // 文本越长、中文越多，列宽权重越大，再按页面可用宽度做比例分配。
         int[] widths = buildColumnWidths(contentUnits, availablePageWidth);
         table.setWidth(Integer.toString(Math.min(sum(widths), availablePageWidth)));
         table.getCTTbl().getTblPr().addNewTblW().setType(STTblWidth.DXA);
@@ -525,6 +1001,11 @@ public class DocxStyleService {
         if (styleId == null || styleId.isBlank()) {
             styleId = templateStyles.normalStyleId();
         }
+        if (isHeadingStyle(styleId, templateStyles)) {
+            // 某些源文档标题段落会带直接编号。
+            // 如果保留下来，套用模板标题样式后可能出现“标题前多出编号”的副作用。
+            clearDirectParagraphNumbering(paragraph);
+        }
         paragraph.setStyle(styleId);
     }
 
@@ -580,6 +1061,25 @@ public class DocxStyleService {
             return null;
         }
         return value.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private boolean isHeadingStyle(String styleId, TemplateStyleSet templateStyles) {
+        if (styleId == null || styleId.isBlank()) {
+            return false;
+        }
+        return styleId.equals(templateStyles.heading1StyleId())
+                || styleId.equals(templateStyles.heading2StyleId())
+                || styleId.equals(templateStyles.heading3StyleId());
+    }
+
+    private void clearDirectParagraphNumbering(XWPFParagraph paragraph) {
+        if (paragraph == null || paragraph.getCTP() == null || paragraph.getCTP().getPPr() == null) {
+            return;
+        }
+        CTPPr properties = paragraph.getCTP().getPPr();
+        if (properties.isSetNumPr()) {
+            properties.unsetNumPr();
+        }
     }
 
     private void removeTableStyle(XWPFTable table) {
@@ -654,21 +1154,48 @@ public class DocxStyleService {
                     styleIdByName.put(normalizeStyleName(styleInfo.name()), styleInfo.styleId());
                 }
             }
+            // 这里约定“通过样式名称找模板样式”，而不是写死 styleId。
+            // 原因是同一模板在不同环境里，styleId 可能变化，但样式名称更稳定。
             String normalStyleId = findRequiredStyleId(styleIdByName, "normal");
             String tableHeaderStyleId = findRequiredStyleId(styleIdByName, "表格-表头居中");
-            String tableBodyStyleId = findRequiredStyleId(styleIdByName, "表格内容");
-            return new TemplateStyleSet(styleIdByName, normalStyleId, tableHeaderStyleId, tableBodyStyleId);
+            String tableBodyStyleId = findRequiredStyleId(styleIdByName, "表格-内容居中", "表格文字", "表格内容");
+            String titleStyleId = findOptionalStyleId(styleIdByName, "封面");
+            String heading1StyleId = findOptionalStyleId(styleIdByName, "heading 1");
+            String heading2StyleId = findOptionalStyleId(styleIdByName, "heading 2");
+            String heading3StyleId = findOptionalStyleId(styleIdByName, "heading 3");
+            return new TemplateStyleSet(
+                    styleIdByName,
+                    normalStyleId,
+                    tableHeaderStyleId,
+                    tableBodyStyleId,
+                    titleStyleId,
+                    heading1StyleId,
+                    heading2StyleId,
+                    heading3StyleId
+            );
         } catch (Exception ex) {
             throw new IOException("读取模板样式失败", ex);
         }
     }
 
-    private String findRequiredStyleId(Map<String, String> styleIdByName, String styleName) {
-        String styleId = styleIdByName.get(normalizeStyleName(styleName));
-        if (styleId == null) {
-            throw new IllegalStateException("模板缺少样式: " + styleName);
+    private String findRequiredStyleId(Map<String, String> styleIdByName, String... styleNames) {
+        for (String styleName : styleNames) {
+            String styleId = styleIdByName.get(normalizeStyleName(styleName));
+            if (styleId != null) {
+                return styleId;
+            }
         }
-        return styleId;
+        throw new IllegalStateException("模板缺少样式: " + String.join(" / ", styleNames));
+    }
+
+    private String findOptionalStyleId(Map<String, String> styleIdByName, String styleName) {
+        return styleIdByName.get(normalizeStyleName(styleName));
+    }
+
+    private void clearRunDirectFormatting(XWPFRun run) {
+        if (run != null && run.getCTR() != null && run.getCTR().isSetRPr()) {
+            run.getCTR().unsetRPr();
+        }
     }
 
     private Map<String, Style> collectStyles(StyleDefinitionsPart stylePart, Set<String> styleNames, boolean includeDependencies) {
@@ -722,6 +1249,8 @@ public class DocxStyleService {
     private void syncLatentAndDefaults(StyleDefinitionsPart src, StyleDefinitionsPart dst) {
         Styles srcStyles = src.getJaxbElement();
         Styles dstStyles = dst.getJaxbElement();
+        // 除了显式样式列表，Word 还会依赖 latentStyles / docDefaults。
+        // 不同步这两部分时，目标文档可能出现“样式已复制但显示仍不一致”的问题。
         if (srcStyles.getLatentStyles() != null) {
             dstStyles.setLatentStyles(XmlUtils.deepCopy(srcStyles.getLatentStyles()));
         }
@@ -743,6 +1272,182 @@ public class DocxStyleService {
         dstNum.setJaxbElement(XmlUtils.deepCopy(srcNum.getJaxbElement()));
     }
 
+    private void normalizeImageLayout(Path docxPath) throws IOException {
+        Path temp = Files.createTempFile("docx-image-layout-", ".docx");
+        try (ZipInputStream zipIn = new ZipInputStream(Files.newInputStream(docxPath));
+             ZipOutputStream zipOut = new ZipOutputStream(Files.newOutputStream(temp))) {
+            // docx 本质上是 zip 包。
+            // 这里直接改写内部 XML，把图片布局统一成更可控的 anchor 形式。
+            ZipEntry entry;
+            while ((entry = zipIn.getNextEntry()) != null) {
+                byte[] content = zipIn.readAllBytes();
+                ZipEntry newEntry = new ZipEntry(entry.getName());
+                zipOut.putNextEntry(newEntry);
+                if (shouldNormalizeImageLayout(entry.getName())) {
+                    zipOut.write(rewriteImageLayoutXml(content));
+                } else {
+                    zipOut.write(content);
+                }
+                zipOut.closeEntry();
+                zipIn.closeEntry();
+            }
+        }
+        Files.move(temp, docxPath, StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    private boolean shouldNormalizeImageLayout(String entryName) {
+        if (entryName == null) {
+            return false;
+        }
+        return "word/document.xml".equals(entryName)
+                || entryName.matches("word/header\\d+\\.xml")
+                || entryName.matches("word/footer\\d+\\.xml")
+                || "word/footnotes.xml".equals(entryName)
+                || "word/endnotes.xml".equals(entryName);
+    }
+
+    private byte[] rewriteImageLayoutXml(byte[] xmlBytes) throws IOException {
+        try {
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            factory.setNamespaceAware(true);
+            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            Document document = factory.newDocumentBuilder().parse(new ByteArrayInputStream(xmlBytes));
+            boolean changed = normalizeInlinePictures(document);
+            changed |= normalizeAnchoredPictures(document);
+            if (!changed) {
+                return xmlBytes;
+            }
+            TransformerFactory transformerFactory = TransformerFactory.newInstance();
+            transformerFactory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            Transformer transformer = transformerFactory.newTransformer();
+            transformer.setOutputProperty(OutputKeys.ENCODING, StandardCharsets.UTF_8.name());
+            transformer.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "no");
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            transformer.transform(new DOMSource(document), new StreamResult(out));
+            return out.toByteArray();
+        } catch (Exception ex) {
+            throw new IOException("调整图片布局失败", ex);
+        }
+    }
+
+    private boolean normalizeInlinePictures(Document document) {
+        List<Element> inlineElements = new ArrayList<>();
+        NodeList nodes = document.getElementsByTagNameNS(WORDPROCESSING_DRAWING_NS, "inline");
+        for (int index = 0; index < nodes.getLength(); index++) {
+            Node node = nodes.item(index);
+            if (node instanceof Element element) {
+                inlineElements.add(element);
+            }
+        }
+        for (Element inline : inlineElements) {
+            Element anchor = buildStandardAnchor(document, inline, false);
+            inline.getParentNode().replaceChild(anchor, inline);
+        }
+        return !inlineElements.isEmpty();
+    }
+
+    private boolean normalizeAnchoredPictures(Document document) {
+        List<Element> anchorElements = new ArrayList<>();
+        NodeList nodes = document.getElementsByTagNameNS(WORDPROCESSING_DRAWING_NS, "anchor");
+        for (int index = 0; index < nodes.getLength(); index++) {
+            Node node = nodes.item(index);
+            if (node instanceof Element element) {
+                anchorElements.add(element);
+            }
+        }
+        for (Element anchor : anchorElements) {
+            Element normalized = buildStandardAnchor(document, anchor, true);
+            anchor.getParentNode().replaceChild(normalized, anchor);
+        }
+        return !anchorElements.isEmpty();
+    }
+
+    private Element buildStandardAnchor(Document document, Element source, boolean preserveHorizontalPosition) {
+        // 统一生成一套固定 anchor 结构，减少不同来源文档带来的布局漂移。
+        Element anchor = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:anchor");
+        anchor.setAttribute("distT", "0");
+        anchor.setAttribute("distB", "0");
+        anchor.setAttribute("distL", "0");
+        anchor.setAttribute("distR", "0");
+        anchor.setAttribute("simplePos", "0");
+        anchor.setAttribute("relativeHeight", "0");
+        anchor.setAttribute("behindDoc", "0");
+        anchor.setAttribute("locked", "0");
+        anchor.setAttribute("layoutInCell", "1");
+        anchor.setAttribute("allowOverlap", "1");
+
+        anchor.appendChild(createSimplePos(document));
+        anchor.appendChild(createHorizontalPosition(document, source, preserveHorizontalPosition));
+        anchor.appendChild(createVerticalPosition(document));
+        appendClonedChildIfPresent(document, source, anchor, "extent");
+        appendClonedChildIfPresent(document, source, anchor, "effectExtent");
+        anchor.appendChild(createWrapSquare(document));
+        appendClonedChildIfPresent(document, source, anchor, "docPr");
+        appendClonedChildIfPresent(document, source, anchor, "cNvGraphicFramePr");
+        appendClonedChildIfPresent(document, source, anchor, "graphic");
+        return anchor;
+    }
+
+    private Element createSimplePos(Document document) {
+        Element simplePos = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:simplePos");
+        simplePos.setAttribute("x", "0");
+        simplePos.setAttribute("y", "0");
+        return simplePos;
+    }
+
+    private Element createHorizontalPosition(Document document, Element source, boolean preserveHorizontalPosition) {
+        if (preserveHorizontalPosition) {
+            Element existing = findDirectChild(source, "positionH");
+            if (existing != null) {
+                return (Element) document.importNode(existing, true);
+            }
+        }
+        Element positionH = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:positionH");
+        positionH.setAttribute("relativeFrom", "page");
+        Element posOffset = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:posOffset");
+        posOffset.setTextContent("0");
+        positionH.appendChild(posOffset);
+        return positionH;
+    }
+
+    private Element createVerticalPosition(Document document) {
+        Element positionV = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:positionV");
+        positionV.setAttribute("relativeFrom", "page");
+        Element posOffset = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:posOffset");
+        posOffset.setTextContent("0");
+        positionV.appendChild(posOffset);
+        return positionV;
+    }
+
+    private Element createWrapSquare(Document document) {
+        Element wrapSquare = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:wrapSquare");
+        wrapSquare.setAttribute("wrapText", "bothSides");
+        return wrapSquare;
+    }
+
+    private void appendClonedChildIfPresent(Document document, Element source, Element target, String localName) {
+        Element child = findDirectChild(source, localName);
+        if (child != null) {
+            target.appendChild(document.importNode(child, true));
+        }
+    }
+
+    private Element findDirectChild(Element parent, String localName) {
+        if (parent == null) {
+            return null;
+        }
+        Node child = parent.getFirstChild();
+        while (child != null) {
+            if (child instanceof Element element
+                    && WORDPROCESSING_DRAWING_NS.equals(element.getNamespaceURI())
+                    && localName.equals(element.getLocalName())) {
+                return element;
+            }
+            child = child.getNextSibling();
+        }
+        return null;
+    }
+
     private ConvertedFile ensureDocx(Path path, List<Path> tempFiles, boolean readOnly) throws IOException {
         String extension = FilenameUtils.getExtension(path.getFileName().toString()).toLowerCase(Locale.ROOT);
         if ("docx".equals(extension)) {
@@ -751,6 +1456,7 @@ public class DocxStyleService {
         if (!"doc".equals(extension)) {
             throw new IllegalArgumentException("仅支援 .doc 或 .docx 文件: " + path);
         }
+        // 旧版 .doc 无法直接按 docx 逻辑处理，因此先转换成临时或旁路的 .docx。
         if (readOnly) {
             Path temp = Files.createTempFile("poi-doc-convert-", ".docx");
             tempFiles.add(temp);
@@ -796,6 +1502,8 @@ public class DocxStyleService {
             tables.add(iterator.next());
         }
         int tableIndex = 0;
+        // HWPF 的段落流里“表格内容也是段落”，
+        // 所以这里要一边扫段落，一边判断当前段落是否落在某个表格范围内。
         for (int i = 0; i < range.numParagraphs(); i++) {
             Paragraph paragraph = range.getParagraph(i);
             Table currentTable = null;
@@ -955,7 +1663,14 @@ public class DocxStyleService {
             Map<String, String> styleIdByName,
             String normalStyleId,
             String tableHeaderStyleId,
-            String tableBodyStyleId
+            String tableBodyStyleId,
+            String titleStyleId,
+            String heading1StyleId,
+            String heading2StyleId,
+            String heading3StyleId
     ) {
+    }
+
+    private record MarkdownNumbering(BigInteger bulletNumId, BigInteger orderedNumId) {
     }
 }

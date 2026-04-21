@@ -54,12 +54,14 @@ public class DocxStyleServer {
         Javalin app = Javalin.create(config -> {
             config.http.defaultContentType = "application/json";
             config.http.maxRequestSize = 50L * 1024 * 1024; // 50MB
-            config.staticFiles.add("/public");
         });
 
         app.exception(Exception.class, (e, ctx) -> {
             ctx.status(500).json(Map.of("error", e.getMessage()));
         });
+
+        app.get("/", this::sendIndex);
+        app.get("/index.html", this::sendIndex);
 
         app.post("/api/styles/list", ctx -> {
             Path source = saveUpload(ctx, "file", "list-src", Set.of("doc", "docx"));
@@ -201,6 +203,21 @@ public class DocxStyleServer {
             }
         });
 
+        app.post("/api/markdown/convert", ctx -> {
+            Path markdown = saveMarkdownInput(ctx, "file", "markdown");
+            Path template = saveUploadOrTemplate(ctx, "templateFile", "md-template-");
+            String title = ctx.formParam("title");
+            String sourceName = resolveMarkdownSourceName(ctx.uploadedFile("file"), title);
+            try {
+                Path result = service.convertMarkdown(markdown, template, title);
+                sendDocx(ctx, result, buildMarkdownFilename(sourceName));
+                deleteQuiet(result);
+            } finally {
+                deleteQuiet(markdown);
+                deleteQuiet(template);
+            }
+        });
+
         app.post("/api/styles/clean", ctx -> {
             Path target = saveUpload(ctx, "file", "clean-", Set.of("doc", "docx"));
             StyleSelection selection = resolveStyleSelection(ctx, false);
@@ -227,6 +244,11 @@ public class DocxStyleServer {
         ctx.contentType("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
         ctx.header("Content-Disposition", buildAttachmentDisposition(filename));
         ctx.result(bytes);
+    }
+
+    private void sendIndex(Context ctx) throws IOException {
+        ctx.contentType("text/html; charset=UTF-8");
+        ctx.result(readClasspathResource("/public/index.html"));
     }
 
     private void sendZip(Context ctx, Path file, String filename) throws IOException {
@@ -281,6 +303,20 @@ public class DocxStyleServer {
         return saveUploadedFile(upload, prefix, allowedExtensions);
     }
 
+    private Path saveMarkdownInput(Context ctx, String fileField, String textField) throws IOException {
+        UploadedFile upload = ctx.uploadedFile(fileField);
+        if (upload != null && upload.size() > 0) {
+            return saveTextFile(upload, "markdown-", Set.of("md", "markdown", "txt"));
+        }
+        String markdown = ctx.formParam(textField);
+        if (markdown == null || markdown.isBlank()) {
+            throw new BadRequestResponse("缺少 Markdown 内容，请上传文件或填写文本。");
+        }
+        Path temp = Files.createTempFile(workDir, "markdown-", ".md");
+        Files.writeString(temp, markdown, StandardCharsets.UTF_8);
+        return temp;
+    }
+
     private Path saveUploadedFile(UploadedFile upload, String prefix, Set<String> allowedExtensions) throws IOException {
         String originalName = upload.filename();
         Path temp = Files.createTempFile(workDir, prefix, ".tmp");
@@ -299,6 +335,22 @@ public class DocxStyleServer {
             throw new BadRequestResponse("文件格式不被允许: " + safeOriginalName(originalName));
         }
         return ensureExtension(temp, detectedExtension);
+    }
+
+    private Path saveTextFile(UploadedFile upload, String prefix, Set<String> allowedExtensions) throws IOException {
+        String originalName = safeOriginalName(upload.filename());
+        String extension = FilenameUtils.getExtension(originalName).toLowerCase(Locale.ROOT);
+        if (extension.isBlank()) {
+            extension = "md";
+        }
+        if (allowedExtensions != null && !allowedExtensions.isEmpty() && !allowedExtensions.contains(extension)) {
+            throw new BadRequestResponse("文件格式不被允许: " + originalName);
+        }
+        Path temp = Files.createTempFile(workDir, prefix, "." + extension);
+        try (var in = upload.content()) {
+            Files.copy(in, temp, StandardCopyOption.REPLACE_EXISTING);
+        }
+        return temp;
     }
 
     private String detectDocExtension(Path file, String originalName) throws IOException {
@@ -356,6 +408,25 @@ public class DocxStyleServer {
         return baseName + "_已格式化.docx";
     }
 
+    private String buildMarkdownFilename(String originalName) {
+        String safeName = safeOriginalName(originalName);
+        String baseName = FilenameUtils.getBaseName(safeName);
+        if (baseName == null || baseName.isBlank()) {
+            baseName = "markdown";
+        }
+        return baseName + "_已转换.docx";
+    }
+
+    private String resolveMarkdownSourceName(UploadedFile upload, String title) {
+        if (upload != null && upload.filename() != null && !upload.filename().isBlank()) {
+            return upload.filename();
+        }
+        if (title != null && !title.isBlank()) {
+            return title.trim() + ".md";
+        }
+        return "markdown.md";
+    }
+
     private Path extractTemplate(String prefix) throws IOException {
         String resourcePath = "/template/template.docx";
         try (var stream = DocxStyleServer.class.getResourceAsStream(resourcePath)) {
@@ -365,6 +436,15 @@ public class DocxStyleServer {
             Path temp = Files.createTempFile(workDir, prefix, ".docx");
             Files.copy(stream, temp, StandardCopyOption.REPLACE_EXISTING);
             return temp;
+        }
+    }
+
+    private String readClasspathResource(String resourcePath) throws IOException {
+        try (InputStream stream = DocxStyleServer.class.getResourceAsStream(resourcePath)) {
+            if (stream == null) {
+                throw new IllegalStateException("找不到内置资源: " + resourcePath);
+            }
+            return new String(stream.readAllBytes(), StandardCharsets.UTF_8);
         }
     }
 

@@ -96,11 +96,34 @@
             <input type="file" name="file" accept=".doc,.docx" required>
         </label>
         <div class="result">
-            按内置模板样式格式化正文；表格按 wps.vbs 宏规则处理，移除表格样式，首行加粗并填充灰色底纹。
+            按内置模板样式格式化正文；移除表格样式，首行加粗并填充灰色底纹。
         </div>
         <button type="submit">执行格式化</button>
     </form>
     <div class="result" id="format-result"></div>
+</div>
+
+<div class="section" id="markdown-section">
+    <h2>6. Markdown 转 DOCX</h2>
+    <form id="markdown-form">
+        <label>Markdown 文件 (.md/.markdown/.txt，可留空直接填写文本)
+            <input type="file" name="file" accept=".md,.markdown,.txt">
+        </label>
+        <label>或直接填写 Markdown
+            <textarea name="markdown" rows="10" placeholder="# 标题&#10;&#10;这是 **Markdown** 正文。&#10;&#10;- 列表项 1&#10;- 列表项 2"></textarea>
+        </label>
+        <label>文档标题（可选，优先作为公文标题）
+            <input type="text" name="title" placeholder="例如：关于开展专项检查的通知">
+        </label>
+        <label>DOCX 模板 (.docx，可留空使用内置模板)
+            <input type="file" name="templateFile" accept=".docx">
+        </label>
+        <div class="result">
+            支持标题、段落、有序/无序列表、引用、围栏代码块、Markdown 表格、粗体/斜体/行内代码。
+        </div>
+        <button type="submit">转换为 DOCX</button>
+    </form>
+    <div class="result" id="markdown-result"></div>
 </div>
 
 <script>
@@ -112,7 +135,8 @@
         // 迁移接口在单文件时返回 DOCX，多文件时返回 ZIP，因此不固定文件名，交给服务端通过 Content-Disposition 指定
         {id: 'migrate-form', endpoint: '/api/styles/migrate', result: 'migrate-result', type: 'blob'},
         {id: 'clean-form', endpoint: '/api/styles/clean', result: 'clean-result', type: 'blob', filename: 'cleaned.docx'},
-        {id: 'format-form', endpoint: '/api/styles/format', result: 'format-result', type: 'blob'}
+        {id: 'format-form', endpoint: '/api/styles/format', result: 'format-result', type: 'blob'},
+        {id: 'markdown-form', endpoint: '/api/markdown/convert', result: 'markdown-result', type: 'blob'}
     ];
 
     function extractFilename(disposition) {

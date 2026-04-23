@@ -96,6 +96,7 @@ import javax.xml.transform.stream.StreamResult;
 public class DocxStyleService {
 
     private static final String WORDPROCESSING_DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+    private static final String WORDPROCESSINGML_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
     private static final Pattern MARKDOWN_HEADING = Pattern.compile("^(#{1,6})\\s+(.*)$");
     private static final Pattern MARKDOWN_BULLET = Pattern.compile("^(\\s*)[-+*]\\s+(.*)$");
     private static final Pattern MARKDOWN_ORDERED = Pattern.compile("^(\\s*)(\\d+)\\.\\s+(.*)$");
@@ -162,9 +163,12 @@ public class DocxStyleService {
             // 最后基于“原始段落样式名 -> 模板样式 ID”的映射逐段重设格式。
             Path template = extractBuiltinTemplate(tempFiles);
             Map<String, String> originalStyleNames = readParagraphStyleNames(target.effectivePath);
+            List<ParagraphNumberingSnapshot> originalParagraphNumbering =
+                readParagraphNumberingSnapshots(target.effectivePath);
             TemplateStyleSet templateStyles = loadTemplateStyleSet(template);
             transferAllStyles(template, target.effectivePath, true);
-            applyDocumentFormat(target.effectivePath, template, originalStyleNames, templateStyles);
+            applyDocumentFormat(target.effectivePath, template, originalStyleNames, originalParagraphNumbering,
+                templateStyles);
             return finalizeTarget(target, document);
         } finally {
             cleanupTemps(tempFiles);
@@ -300,13 +304,17 @@ public class DocxStyleService {
     private void applyDocumentFormat(Path docxPath,
         Path templatePath,
         Map<String, String> originalStyleNames,
+        List<ParagraphNumberingSnapshot> originalParagraphNumbering,
         TemplateStyleSet templateStyles) throws IOException {
         try (InputStream in = Files.newInputStream(docxPath);
             InputStream templateIn = Files.newInputStream(templatePath);
             XWPFDocument document = new XWPFDocument(in);
             XWPFDocument templateDocument = new XWPFDocument(templateIn)) {
             applyTemplateSectionProperties(document, templateDocument);
-            formatBodyElements(document.getBodyElements(), originalStyleNames, templateStyles, false);
+            BodyListNumberingContext bodyListNumbering = ensureBodyListNumberingContext(document);
+            ParagraphTraversalState traversalState = new ParagraphTraversalState();
+            formatBodyElements(document.getBodyElements(), originalStyleNames, originalParagraphNumbering,
+                traversalState, templateStyles, bodyListNumbering, false);
             try (OutputStream out = Files.newOutputStream(docxPath)) {
                 document.write(out);
             }
@@ -334,7 +342,7 @@ public class DocxStyleService {
         List<String> lines = normalizeMarkdown(markdown);
         boolean titleWritten = false;
         if (documentTitle != null && !documentTitle.isBlank()) {
-            appendStyledParagraph(document, documentTitle.trim(), resolveTitleStyleId(templateStyles), false);
+            appendStyledParagraph(document, documentTitle.trim(), resolveTitleStyleId(templateStyles), true);
             titleWritten = true;
         }
 
@@ -355,7 +363,7 @@ public class DocxStyleService {
                 int level = headingMatcher.group(1).length();
                 String text = headingMatcher.group(2).trim();
                 boolean useTitle = level == 1 && !titleWritten;
-                appendStyledParagraph(document, text, resolveHeadingStyleId(level, useTitle, templateStyles), false);
+                appendStyledParagraph(document, text, resolveHeadingStyleId(level, useTitle, templateStyles), true);
                 titleWritten = titleWritten || useTitle;
                 index++;
                 continue;
@@ -724,24 +732,42 @@ public class DocxStyleService {
         return templateStyles.normalStyleId();
     }
 
-    private void formatBodyElements(List<IBodyElement> bodyElements, Map<String, String> originalStyleNames,
-        TemplateStyleSet templateStyles, boolean inTable) {
+    private void formatBodyElements(List<IBodyElement> bodyElements,
+        Map<String, String> originalStyleNames,
+        List<ParagraphNumberingSnapshot> originalParagraphNumbering,
+        ParagraphTraversalState traversalState,
+        TemplateStyleSet templateStyles,
+        BodyListNumberingContext bodyListNumbering,
+        boolean inTable) {
         for (IBodyElement bodyElement : bodyElements) {
             if (bodyElement instanceof XWPFParagraph paragraph) {
+                ParagraphNumberingSnapshot numberingSnapshot =
+                    nextParagraphNumberingSnapshot(originalParagraphNumbering, traversalState);
                 if (!inTable) {
                     // 普通段落根据原文样式名重新映射到模板样式。
-                    applyTemplateParagraphStyle(paragraph, originalStyleNames, templateStyles);
+                    applyTemplateParagraphStyle(paragraph, originalStyleNames, templateStyles, numberingSnapshot,
+                        bodyListNumbering);
                 }
                 continue;
             }
             if (bodyElement instanceof XWPFTable table) {
                 // 表格不只改表框，还会递归处理单元格内段落和嵌套表格。
-                formatTable(table, templateStyles, resolveAvailablePageWidth(bodyElement));
+                formatTable(table, originalParagraphNumbering, traversalState, templateStyles, bodyListNumbering,
+                    resolveAvailablePageWidth(bodyElement));
             }
         }
     }
 
     private void formatTable(XWPFTable table, TemplateStyleSet templateStyles, int availablePageWidth) {
+        formatTable(table, List.of(), new ParagraphTraversalState(), templateStyles, null, availablePageWidth);
+    }
+
+    private void formatTable(XWPFTable table,
+        List<ParagraphNumberingSnapshot> originalParagraphNumbering,
+        ParagraphTraversalState traversalState,
+        TemplateStyleSet templateStyles,
+        BodyListNumberingContext bodyListNumbering,
+        int availablePageWidth) {
         // 表格格式化的主入口，可以把它理解成 4 个阶段：
         // 1. 清掉原表格样式，避免来源模板的表格主题继续干扰。
         // 2. 统一设置对齐、内边距、边框、列宽。
@@ -763,7 +789,8 @@ public class DocxStyleService {
                 if (headerRow) {
                     cell.setColor("D9D9D9");
                 }
-                formatTableCell(cell, templateStyles, headerRow);
+                formatTableCell(cell, originalParagraphNumbering, traversalState, templateStyles, bodyListNumbering,
+                    headerRow);
             }
         }
     }
@@ -836,9 +863,15 @@ public class DocxStyleService {
         return normalized.isEmpty() || "continue".equals(normalized);
     }
 
-    private void formatTableCell(XWPFTableCell cell, TemplateStyleSet templateStyles, boolean headerRow) {
+    private void formatTableCell(XWPFTableCell cell,
+        List<ParagraphNumberingSnapshot> originalParagraphNumbering,
+        ParagraphTraversalState traversalState,
+        TemplateStyleSet templateStyles,
+        BodyListNumberingContext bodyListNumbering,
+        boolean headerRow) {
         for (IBodyElement bodyElement : cell.getBodyElements()) {
             if (bodyElement instanceof XWPFParagraph paragraph) {
+                nextParagraphNumberingSnapshot(originalParagraphNumbering, traversalState);
                 // 单元格里的段落常常带有来源文档残留的边框、缩进、行距、run 直设格式。
                 // 这里先“去直设”，再统一回到模板样式，避免看起来像是样式复制失败。
                 clearParagraphBorders(paragraph);
@@ -855,7 +888,8 @@ public class DocxStyleService {
             }
             if (bodyElement instanceof XWPFTable nestedTable) {
                 // 嵌套表格按同一套规则递归处理，否则外层表格正常、内层表格仍会保留旧格式。
-                formatTable(nestedTable, templateStyles, resolveAvailablePageWidth(nestedTable));
+                formatTable(nestedTable, originalParagraphNumbering, traversalState, templateStyles,
+                    bodyListNumbering, resolveAvailablePageWidth(nestedTable));
             }
         }
     }
@@ -1090,21 +1124,40 @@ public class DocxStyleService {
         return defaultValue;
     }
 
-    private void applyTemplateParagraphStyle(XWPFParagraph paragraph, Map<String, String> originalStyleNames,
-        TemplateStyleSet templateStyles) {
+    private void applyTemplateParagraphStyle(XWPFParagraph paragraph,
+        Map<String, String> originalStyleNames,
+        TemplateStyleSet templateStyles,
+        ParagraphNumberingSnapshot numberingSnapshot,
+        BodyListNumberingContext bodyListNumbering) {
         String styleId = resolveParagraphStyleId(paragraph, originalStyleNames, templateStyles);
         if (styleId == null || styleId.isBlank()) {
             styleId = templateStyles.normalStyleId();
         }
-        if (isHeadingStyle(styleId, templateStyles)) {
+        boolean headingStyle = isHeadingStyle(styleId, templateStyles);
+        if (headingStyle) {
             // 某些源文档标题段落会带直接编号。
             // 如果保留下来，套用模板标题样式后可能出现“标题前多出编号”的副作用。
             clearDirectParagraphNumbering(paragraph);
-            // 仅清编号还不够，源文档常会把编号缩进直接写在段落上。
-            // 如果不一起清掉，重新套用模板编号后会出现标题缩进错乱。
-            applyZeroParagraphIndentation(paragraph);
+            // 标题缩进应完全依赖模板样式，因此这里只清掉段落上的直设缩进，
+            // 不再在代码里把标题缩进硬置为 0。
+            clearParagraphIndentation(paragraph);
         }
         paragraph.setStyle(styleId);
+        if (!headingStyle && numberingSnapshot.hasDirectNumbering()) {
+            // 正文列表不能继续沿用源文档 numId。
+            // 模板编号一旦覆盖 numbering.xml，旧 numId 很可能会指向模板标题编号。
+            applyIsolatedBodyListNumbering(paragraph, numberingSnapshot, bodyListNumbering);
+        }
+    }
+
+    private void applyIsolatedBodyListNumbering(XWPFParagraph paragraph,
+        ParagraphNumberingSnapshot numberingSnapshot,
+        BodyListNumberingContext bodyListNumbering) {
+        clearDirectParagraphNumbering(paragraph);
+        clearParagraphIndentation(paragraph);
+        BigInteger isolatedNumId = bodyListNumbering.resolveNumId(numberingSnapshot.originalNumId(),
+            numberingSnapshot.ordered());
+        applyListNumbering(paragraph, isolatedNumId, numberingSnapshot.level());
     }
 
     private String resolveParagraphStyleId(XWPFParagraph paragraph, Map<String, String> originalStyleNames,
@@ -1241,6 +1294,188 @@ public class DocxStyleService {
         indentation.setRightChars(BigInteger.ZERO);
         indentation.setFirstLineChars(BigInteger.ZERO);
         indentation.setHangingChars(BigInteger.ZERO);
+    }
+
+    private List<ParagraphNumberingSnapshot> readParagraphNumberingSnapshots(Path docxPath) throws IOException {
+        NumberingDefinitionLookup numberingLookup = readNumberingDefinitionLookup(docxPath);
+        try (InputStream in = Files.newInputStream(docxPath);
+            XWPFDocument document = new XWPFDocument(in)) {
+            List<ParagraphNumberingSnapshot> snapshots = new ArrayList<>();
+            collectParagraphNumberingSnapshots(document.getBodyElements(), snapshots, numberingLookup);
+            return snapshots;
+        }
+    }
+
+    private void collectParagraphNumberingSnapshots(List<IBodyElement> bodyElements,
+        List<ParagraphNumberingSnapshot> snapshots,
+        NumberingDefinitionLookup numberingLookup) {
+        for (IBodyElement bodyElement : bodyElements) {
+            if (bodyElement instanceof XWPFParagraph paragraph) {
+                snapshots.add(extractParagraphNumberingSnapshot(paragraph, numberingLookup));
+                continue;
+            }
+            if (bodyElement instanceof XWPFTable table) {
+                for (XWPFTableRow row : table.getRows()) {
+                    for (XWPFTableCell cell : row.getTableCells()) {
+                        collectParagraphNumberingSnapshots(cell.getBodyElements(), snapshots, numberingLookup);
+                    }
+                }
+            }
+        }
+    }
+
+    private ParagraphNumberingSnapshot extractParagraphNumberingSnapshot(XWPFParagraph paragraph,
+        NumberingDefinitionLookup numberingLookup) {
+        if (paragraph == null || paragraph.getCTP() == null || paragraph.getCTP().getPPr() == null) {
+            return ParagraphNumberingSnapshot.NONE;
+        }
+        CTPPr properties = paragraph.getCTP().getPPr();
+        if (!properties.isSetNumPr() || properties.getNumPr().getNumId() == null) {
+            return ParagraphNumberingSnapshot.NONE;
+        }
+        BigInteger originalNumId = properties.getNumPr().getNumId().getVal();
+        if (originalNumId == null) {
+            return ParagraphNumberingSnapshot.NONE;
+        }
+        int level = 0;
+        if (properties.getNumPr().getIlvl() != null && properties.getNumPr().getIlvl().getVal() != null) {
+            level = properties.getNumPr().getIlvl().getVal().intValue();
+        }
+        return new ParagraphNumberingSnapshot(originalNumId, level, numberingLookup.isOrdered(originalNumId, level));
+    }
+
+    private NumberingDefinitionLookup readNumberingDefinitionLookup(Path docxPath) throws IOException {
+        byte[] numberingXml = readZipEntry(docxPath, "word/numbering.xml");
+        if (numberingXml == null || numberingXml.length == 0) {
+            return NumberingDefinitionLookup.empty();
+        }
+        try {
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            factory.setNamespaceAware(true);
+            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            Document document = factory.newDocumentBuilder().parse(new ByteArrayInputStream(numberingXml));
+
+            Map<BigInteger, BigInteger> numToAbstract = new LinkedHashMap<>();
+            Map<String, String> abstractLevelFormats = new LinkedHashMap<>();
+
+            NodeList abstractNums = document.getElementsByTagNameNS(WORDPROCESSINGML_NS, "abstractNum");
+            for (int index = 0; index < abstractNums.getLength(); index++) {
+                Node node = abstractNums.item(index);
+                if (!(node instanceof Element abstractNum)) {
+                    continue;
+                }
+                BigInteger abstractNumId = parseBigIntegerAttribute(abstractNum, "abstractNumId");
+                if (abstractNumId == null) {
+                    continue;
+                }
+                NodeList levels = abstractNum.getElementsByTagNameNS(WORDPROCESSINGML_NS, "lvl");
+                for (int levelIndex = 0; levelIndex < levels.getLength(); levelIndex++) {
+                    Node levelNode = levels.item(levelIndex);
+                    if (!(levelNode instanceof Element levelElement)) {
+                        continue;
+                    }
+                    BigInteger ilvl = parseBigIntegerAttribute(levelElement, "ilvl");
+                    if (ilvl == null) {
+                        continue;
+                    }
+                    Element numFmt = findDirectChild(levelElement, WORDPROCESSINGML_NS, "numFmt");
+                    String value = numFmt == null ? null : numFmt.getAttributeNS(WORDPROCESSINGML_NS, "val");
+                    if (value == null || value.isBlank()) {
+                        continue;
+                    }
+                    abstractLevelFormats.put(numberingLevelKey(abstractNumId, ilvl.intValue()), value.trim());
+                }
+            }
+
+            NodeList nums = document.getElementsByTagNameNS(WORDPROCESSINGML_NS, "num");
+            for (int index = 0; index < nums.getLength(); index++) {
+                Node node = nums.item(index);
+                if (!(node instanceof Element numElement)) {
+                    continue;
+                }
+                BigInteger numId = parseBigIntegerAttribute(numElement, "numId");
+                Element abstractNumId = findDirectChild(numElement, WORDPROCESSINGML_NS, "abstractNumId");
+                if (numId == null || abstractNumId == null) {
+                    continue;
+                }
+                String value = abstractNumId.getAttributeNS(WORDPROCESSINGML_NS, "val");
+                if (value == null || value.isBlank()) {
+                    continue;
+                }
+                numToAbstract.put(numId, new BigInteger(value.trim()));
+            }
+
+            return new NumberingDefinitionLookup(numToAbstract, abstractLevelFormats);
+        } catch (Exception ex) {
+            throw new IOException("读取编号定义失败", ex);
+        }
+    }
+
+    private byte[] readZipEntry(Path docxPath, String entryName) throws IOException {
+        try (ZipInputStream zipIn = new ZipInputStream(Files.newInputStream(docxPath))) {
+            ZipEntry entry;
+            while ((entry = zipIn.getNextEntry()) != null) {
+                if (entryName.equals(entry.getName())) {
+                    return zipIn.readAllBytes();
+                }
+            }
+        }
+        return null;
+    }
+
+    private BigInteger parseBigIntegerAttribute(Element element, String localName) {
+        if (element == null) {
+            return null;
+        }
+        String value = element.getAttributeNS(WORDPROCESSINGML_NS, localName);
+        if ((value == null || value.isBlank()) && element.hasAttribute(localName)) {
+            value = element.getAttribute(localName);
+        }
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        return new BigInteger(value.trim());
+    }
+
+    private Element findDirectChild(Element parent, String namespaceUri, String localName) {
+        if (parent == null) {
+            return null;
+        }
+        Node child = parent.getFirstChild();
+        while (child != null) {
+            if (child instanceof Element element
+                && Objects.equals(namespaceUri, element.getNamespaceURI())
+                && localName.equals(element.getLocalName())) {
+                return element;
+            }
+            child = child.getNextSibling();
+        }
+        return null;
+    }
+
+    private String numberingLevelKey(BigInteger abstractNumId, int level) {
+        return abstractNumId + "#" + level;
+    }
+
+    private BodyListNumberingContext ensureBodyListNumberingContext(XWPFDocument document) {
+        XWPFNumbering numbering = document.getNumbering();
+        if (numbering == null) {
+            numbering = document.createNumbering();
+        }
+        // 正文列表使用独立 abstractNum，不绑定任何 pStyle，避免和模板标题编号互相污染。
+        BigInteger bulletAbstractNumId = numbering.addAbstractNum(new XWPFAbstractNum(createListAbstractNum(false)));
+        BigInteger orderedAbstractNumId = numbering.addAbstractNum(new XWPFAbstractNum(createListAbstractNum(true)));
+        return new BodyListNumberingContext(numbering, bulletAbstractNumId, orderedAbstractNumId);
+    }
+
+    private ParagraphNumberingSnapshot nextParagraphNumberingSnapshot(
+        List<ParagraphNumberingSnapshot> originalParagraphNumbering,
+        ParagraphTraversalState traversalState) {
+        int paragraphIndex = traversalState.nextParagraphIndex();
+        if (paragraphIndex < 0 || paragraphIndex >= originalParagraphNumbering.size()) {
+            return ParagraphNumberingSnapshot.NONE;
+        }
+        return originalParagraphNumbering.get(paragraphIndex);
     }
 
     private Path extractBuiltinTemplate(List<Path> tempFiles) throws IOException {
@@ -1820,5 +2055,65 @@ public class DocxStyleService {
 
     private record MarkdownNumbering(BigInteger bulletNumId, BigInteger orderedNumId) {
 
+    }
+
+    private record ParagraphNumberingSnapshot(BigInteger originalNumId, int level, boolean ordered) {
+
+        private static final ParagraphNumberingSnapshot NONE = new ParagraphNumberingSnapshot(null, 0, true);
+
+        private boolean hasDirectNumbering() {
+            return originalNumId != null;
+        }
+    }
+
+    private record NumberingDefinitionLookup(Map<BigInteger, BigInteger> numToAbstract,
+        Map<String, String> abstractLevelFormats) {
+
+        private static NumberingDefinitionLookup empty() {
+            return new NumberingDefinitionLookup(Map.of(), Map.of());
+        }
+
+        private boolean isOrdered(BigInteger numId, int level) {
+            BigInteger abstractNumId = numToAbstract.get(numId);
+            if (abstractNumId == null) {
+                return true;
+            }
+            String format = abstractLevelFormats.get(abstractNumId + "#" + level);
+            if (format == null) {
+                format = abstractLevelFormats.get(abstractNumId + "#0");
+            }
+            return format == null || !"bullet".equalsIgnoreCase(format);
+        }
+    }
+
+    private static final class ParagraphTraversalState {
+
+        private int paragraphIndex;
+
+        private int nextParagraphIndex() {
+            return paragraphIndex++;
+        }
+    }
+
+    private static final class BodyListNumberingContext {
+
+        private final XWPFNumbering numbering;
+        private final BigInteger bulletAbstractNumId;
+        private final BigInteger orderedAbstractNumId;
+        private final Map<String, BigInteger> numIdMapping = new LinkedHashMap<>();
+
+        private BodyListNumberingContext(XWPFNumbering numbering,
+            BigInteger bulletAbstractNumId,
+            BigInteger orderedAbstractNumId) {
+            this.numbering = numbering;
+            this.bulletAbstractNumId = bulletAbstractNumId;
+            this.orderedAbstractNumId = orderedAbstractNumId;
+        }
+
+        private BigInteger resolveNumId(BigInteger originalNumId, boolean ordered) {
+            String key = (ordered ? "ordered:" : "bullet:") + originalNumId;
+            return numIdMapping.computeIfAbsent(key, ignored ->
+                numbering.addNum(ordered ? orderedAbstractNumId : bulletAbstractNumId));
+        }
     }
 }

@@ -21,6 +21,7 @@ import org.apache.poi.xwpf.usermodel.XWPFTable;
 import org.apache.poi.xwpf.usermodel.XWPFTableCell;
 import org.apache.poi.xwpf.usermodel.XWPFTableRow;
 import org.apache.poi.xwpf.usermodel.IBodyElement;
+import org.apache.poi.xwpf.usermodel.LineSpacingRule;
 import org.docx4j.openpackaging.exceptions.Docx4JException;
 import org.docx4j.openpackaging.packages.WordprocessingMLPackage;
 import org.docx4j.openpackaging.parts.WordprocessingML.MainDocumentPart;
@@ -42,6 +43,8 @@ import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTLvl;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STJc;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STNumberFormat;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STTblWidth;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
@@ -73,14 +76,8 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
-import java.util.zip.ZipOutputStream;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.transform.OutputKeys;
-import javax.xml.transform.Transformer;
-import javax.xml.transform.TransformerFactory;
-import javax.xml.transform.dom.DOMSource;
-import javax.xml.transform.stream.StreamResult;
 
 /**
  * 提供样式迁移、导出、清理与文档格式化的核心服务。
@@ -95,7 +92,6 @@ import javax.xml.transform.stream.StreamResult;
  */
 public class DocxStyleService {
 
-    private static final String WORDPROCESSING_DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
     private static final String WORDPROCESSINGML_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
     private static final Pattern MARKDOWN_HEADING = Pattern.compile("^(#{1,6})\\s+(.*)$");
     private static final Pattern MARKDOWN_BULLET = Pattern.compile("^(\\s*)[-+*]\\s+(.*)$");
@@ -104,6 +100,7 @@ public class DocxStyleService {
         "^\\s*\\|?(\\s*:?-{3,}:?\\s*\\|)+\\s*:?-{3,}:?\\s*\\|?\\s*$");
     private static final Pattern MARKDOWN_INLINE = Pattern.compile(
         "(\\*\\*[^*]+\\*\\*|__[^_]+__|`[^`]+`|\\*[^*]+\\*|_[^_]+_)");
+    private static final Logger log = LoggerFactory.getLogger(DocxStyleService.class);
 
     public Path migrate(Path source, Path target, Set<String> styleNames, boolean copyNumbering,
         boolean includeDependencies) throws Exception {
@@ -157,11 +154,20 @@ public class DocxStyleService {
 
     public Path formatDocument(Path document) throws Exception {
         List<Path> tempFiles = new ArrayList<>();
+        try {
+            Path template = extractBuiltinTemplate(tempFiles);
+            return formatDocument(document, template);
+        } finally {
+            cleanupTemps(tempFiles);
+        }
+    }
+
+    public Path formatDocument(Path document, Path template) throws Exception {
+        List<Path> tempFiles = new ArrayList<>();
         ConvertedFile target = ensureDocx(document, tempFiles, false);
         try {
-            // 先抽取内置模板，再把模板中的样式定义整体复制到目标文档，
+            // 先使用指定模板，再把模板中的样式定义整体复制到目标文档，
             // 最后基于“原始段落样式名 -> 模板样式 ID”的映射逐段重设格式。
-            Path template = extractBuiltinTemplate(tempFiles);
             Map<String, String> originalStyleNames = readParagraphStyleNames(target.effectivePath);
             List<ParagraphNumberingSnapshot> originalParagraphNumbering =
                 readParagraphNumberingSnapshots(target.effectivePath);
@@ -187,7 +193,6 @@ public class DocxStyleService {
             try (OutputStream out = Files.newOutputStream(output)) {
                 document.write(out);
             }
-            normalizeImageLayout(output);
             return output;
         }
     }
@@ -879,7 +884,10 @@ public class DocxStyleService {
                 paragraph.setSpacingBefore(0);
                 paragraph.setSpacingAfter(0);
                 paragraph.setSpacingBetween(1.0d);
-                paragraph.setStyle(headerRow ? templateStyles.tableHeaderStyleId() : templateStyles.tableBodyStyleId());
+                String tableStyleId = headerRow ? templateStyles.tableHeaderStyleId() : templateStyles.tableBodyStyleId();
+                if (tableStyleId != null && !tableStyleId.isBlank()) {
+                    paragraph.setStyle(tableStyleId);
+                }
                 applyZeroParagraphIndentation(paragraph);
                 for (XWPFRun run : paragraph.getRuns()) {
                     clearRunDirectFormatting(run);
@@ -1143,6 +1151,9 @@ public class DocxStyleService {
             clearParagraphIndentation(paragraph);
         }
         paragraph.setStyle(styleId);
+        if (containsDrawing(paragraph)) {
+            normalizeDrawingParagraphLayout(paragraph);
+        }
         if (!headingStyle && numberingSnapshot.hasDirectNumbering()) {
             // 正文列表不能继续沿用源文档 numId。
             // 模板编号一旦覆盖 numbering.xml，旧 numId 很可能会指向模板标题编号。
@@ -1277,6 +1288,30 @@ public class DocxStyleService {
             return;
         }
         paragraph.getCTP().getPPr().unsetInd();
+    }
+
+    private boolean containsDrawing(XWPFParagraph paragraph) {
+        if (paragraph == null) {
+            return false;
+        }
+        for (XWPFRun run : paragraph.getRuns()) {
+            if (run != null && run.getCTR() != null && run.getCTR().sizeOfDrawingArray() > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void normalizeDrawingParagraphLayout(XWPFParagraph paragraph) {
+        // 行内图片如果落到模板“固定行距”正文样式里，Word 会按行框裁切图片可视区域。
+        // 这里对图片段落加直接格式覆盖：取消缩进，并把行距改为自动，优先保证图片完整显示。
+        clearParagraphIndentation(paragraph);
+        paragraph.setIndentationFirstLine(0);
+        paragraph.setIndentationLeft(0);
+        paragraph.setIndentationHanging(0);
+        paragraph.setSpacingBefore(0);
+        paragraph.setSpacingAfter(0);
+        paragraph.setSpacingBetween(1.0d, LineSpacingRule.AUTO);
     }
 
     private void applyZeroParagraphIndentation(XWPFParagraph paragraph) {
@@ -1515,8 +1550,8 @@ public class DocxStyleService {
             // 这里约定“通过样式名称找模板样式”，而不是写死 styleId。
             // 原因是同一模板在不同环境里，styleId 可能变化，但样式名称更稳定。
             String normalStyleId = findRequiredStyleId(styleIdByName, "normal");
-            String tableHeaderStyleId = findRequiredStyleId(styleIdByName, "表格-表头居中");
-            String tableBodyStyleId = findRequiredStyleId(styleIdByName, "表格-内容居中", "表格文字", "表格内容");
+            String tableHeaderStyleId = findOptionalStyleId(styleIdByName, "表格-表头居中");
+            String tableBodyStyleId = findOptionalStyleId(styleIdByName, "表格-内容居中", "表格文字", "表格内容");
             String titleStyleId = findOptionalStyleId(styleIdByName, "封面");
             String heading1StyleId = findOptionalStyleId(styleIdByName, "heading 1");
             String heading2StyleId = findOptionalStyleId(styleIdByName, "heading 2");
@@ -1532,6 +1567,7 @@ public class DocxStyleService {
                 heading3StyleId
             );
         } catch (Exception ex) {
+            log.error("读取模板样式失败",ex.getMessage(),ex);
             throw new IOException("读取模板样式失败", ex);
         }
     }
@@ -1546,8 +1582,14 @@ public class DocxStyleService {
         throw new IllegalStateException("模板缺少样式: " + String.join(" / ", styleNames));
     }
 
-    private String findOptionalStyleId(Map<String, String> styleIdByName, String styleName) {
-        return styleIdByName.get(normalizeStyleName(styleName));
+    private String findOptionalStyleId(Map<String, String> styleIdByName, String... styleNames) {
+        for (String styleName : styleNames) {
+            String styleId = styleIdByName.get(normalizeStyleName(styleName));
+            if (styleId != null) {
+                return styleId;
+            }
+        }
+        return null;
     }
 
     private void clearRunDirectFormatting(XWPFRun run) {
@@ -1630,198 +1672,6 @@ public class DocxStyleService {
             dstMain.addTargetPart(dstNum);
         }
         dstNum.setJaxbElement(XmlUtils.deepCopy(srcNum.getJaxbElement()));
-    }
-
-    private void normalizeImageLayout(Path docxPath) throws IOException {
-        Path temp = Files.createTempFile("docx-image-layout-", ".docx");
-        try (ZipInputStream zipIn = new ZipInputStream(Files.newInputStream(docxPath));
-            ZipOutputStream zipOut = new ZipOutputStream(Files.newOutputStream(temp))) {
-            // docx 本质上是 zip 包。
-            // 这里直接改写内部 XML，把图片布局统一成更可控的 anchor 形式。
-            // 学习点：
-            // 1. Word 里的图片如果是 wp:inline，表示“嵌入文字行内”，通常不能做环绕。
-            // 2. 想要“四周环绕型”，通常要改成 wp:anchor，并补上 wrapSquare / positionH / positionV 等节点。
-            ZipEntry entry;
-            while ((entry = zipIn.getNextEntry()) != null) {
-                byte[] content = zipIn.readAllBytes();
-                ZipEntry newEntry = new ZipEntry(entry.getName());
-                zipOut.putNextEntry(newEntry);
-                if (shouldNormalizeImageLayout(entry.getName())) {
-                    zipOut.write(rewriteImageLayoutXml(content));
-                } else {
-                    zipOut.write(content);
-                }
-                zipOut.closeEntry();
-                zipIn.closeEntry();
-            }
-        }
-        Files.move(temp, docxPath, StandardCopyOption.REPLACE_EXISTING);
-    }
-
-    private boolean shouldNormalizeImageLayout(String entryName) {
-        if (entryName == null) {
-            return false;
-        }
-        return "word/document.xml".equals(entryName)
-            || entryName.matches("word/header\\d+\\.xml")
-            || entryName.matches("word/footer\\d+\\.xml")
-            || "word/footnotes.xml".equals(entryName)
-            || "word/endnotes.xml".equals(entryName);
-    }
-
-    private byte[] rewriteImageLayoutXml(byte[] xmlBytes) throws IOException {
-        try {
-            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            factory.setNamespaceAware(true);
-            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-            Document document = factory.newDocumentBuilder().parse(new ByteArrayInputStream(xmlBytes));
-            // 分两步做归一化：
-            // 1. inline 图片转成 anchor。
-            // 2. 已经是 anchor 的图片也重新生成一次，覆盖掉来源文档中不一致的定位参数。
-            boolean changed = normalizeInlinePictures(document);
-            changed |= normalizeAnchoredPictures(document);
-            if (!changed) {
-                return xmlBytes;
-            }
-            TransformerFactory transformerFactory = TransformerFactory.newInstance();
-            transformerFactory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-            Transformer transformer = transformerFactory.newTransformer();
-            transformer.setOutputProperty(OutputKeys.ENCODING, StandardCharsets.UTF_8.name());
-            transformer.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "no");
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            transformer.transform(new DOMSource(document), new StreamResult(out));
-            return out.toByteArray();
-        } catch (Exception ex) {
-            throw new IOException("调整图片布局失败", ex);
-        }
-    }
-
-    private boolean normalizeInlinePictures(Document document) {
-        List<Element> inlineElements = new ArrayList<>();
-        NodeList nodes = document.getElementsByTagNameNS(WORDPROCESSING_DRAWING_NS, "inline");
-        for (int index = 0; index < nodes.getLength(); index++) {
-            Node node = nodes.item(index);
-            if (node instanceof Element element) {
-                inlineElements.add(element);
-            }
-        }
-        for (Element inline : inlineElements) {
-            // inline -> anchor：这是把“行内图片”变成“可环绕浮动图片”的关键一步。
-            Element anchor = buildStandardAnchor(document, inline, false);
-            inline.getParentNode().replaceChild(anchor, inline);
-        }
-        return !inlineElements.isEmpty();
-    }
-
-    private boolean normalizeAnchoredPictures(Document document) {
-        List<Element> anchorElements = new ArrayList<>();
-        NodeList nodes = document.getElementsByTagNameNS(WORDPROCESSING_DRAWING_NS, "anchor");
-        for (int index = 0; index < nodes.getLength(); index++) {
-            Node node = nodes.item(index);
-            if (node instanceof Element element) {
-                anchorElements.add(element);
-            }
-        }
-        for (Element anchor : anchorElements) {
-            // 已有 anchor 也要标准化，避免原文档残留其它环绕方式、偏移量、层级参数。
-            Element normalized = buildStandardAnchor(document, anchor, true);
-            anchor.getParentNode().replaceChild(normalized, anchor);
-        }
-        return !anchorElements.isEmpty();
-    }
-
-    private Element buildStandardAnchor(Document document, Element source, boolean preserveHorizontalPosition) {
-        // 统一生成一套固定 anchor 结构，减少不同来源文档带来的布局漂移。
-        // 可以把这里理解成在拼 Word 的“图片版式面板”：
-        // - positionH / positionV：水平、垂直定位
-        // - wrapSquare：四周环绕
-        // - extent / graphic：图片尺寸与图形本体
-        Element anchor = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:anchor");
-        anchor.setAttribute("distT", "0");
-        anchor.setAttribute("distB", "0");
-        anchor.setAttribute("distL", "0");
-        anchor.setAttribute("distR", "0");
-        anchor.setAttribute("simplePos", "0");
-        anchor.setAttribute("relativeHeight", "0");
-        anchor.setAttribute("behindDoc", "0");
-        anchor.setAttribute("locked", "0");
-        anchor.setAttribute("layoutInCell", "1");
-        anchor.setAttribute("allowOverlap", "1");
-
-        anchor.appendChild(createSimplePos(document));
-        anchor.appendChild(createHorizontalPosition(document, source, preserveHorizontalPosition));
-        anchor.appendChild(createVerticalPosition(document));
-        appendClonedChildIfPresent(document, source, anchor, "extent");
-        appendClonedChildIfPresent(document, source, anchor, "effectExtent");
-        anchor.appendChild(createWrapSquare(document));
-        appendClonedChildIfPresent(document, source, anchor, "docPr");
-        appendClonedChildIfPresent(document, source, anchor, "cNvGraphicFramePr");
-        appendClonedChildIfPresent(document, source, anchor, "graphic");
-        return anchor;
-    }
-
-    private Element createSimplePos(Document document) {
-        Element simplePos = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:simplePos");
-        simplePos.setAttribute("x", "0");
-        simplePos.setAttribute("y", "0");
-        return simplePos;
-    }
-
-    private Element createHorizontalPosition(Document document, Element source, boolean preserveHorizontalPosition) {
-        if (preserveHorizontalPosition) {
-            Element existing = findDirectChild(source, "positionH");
-            if (existing != null) {
-                // 水平位置允许沿用旧值，避免把用户原本左右摆放好的图片全部强制吸到同一列。
-                return (Element) document.importNode(existing, true);
-            }
-        }
-        Element positionH = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:positionH");
-        positionH.setAttribute("relativeFrom", "page");
-        Element posOffset = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:posOffset");
-        posOffset.setTextContent("0");
-        positionH.appendChild(posOffset);
-        return positionH;
-    }
-
-    private Element createVerticalPosition(Document document) {
-        Element positionV = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:positionV");
-        // relativeFrom="page" + posOffset=0
-        // 对应 Word UI 里常见的“垂直：相对于页面，绝对位置 0”。
-        positionV.setAttribute("relativeFrom", "page");
-        Element posOffset = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:posOffset");
-        posOffset.setTextContent("0");
-        positionV.appendChild(posOffset);
-        return positionV;
-    }
-
-    private Element createWrapSquare(Document document) {
-        Element wrapSquare = document.createElementNS(WORDPROCESSING_DRAWING_NS, "wp:wrapSquare");
-        // wrapText="bothSides" 对应“四周环绕”，文字会在图片左右两侧绕排。
-        wrapSquare.setAttribute("wrapText", "bothSides");
-        return wrapSquare;
-    }
-
-    private void appendClonedChildIfPresent(Document document, Element source, Element target, String localName) {
-        Element child = findDirectChild(source, localName);
-        if (child != null) {
-            target.appendChild(document.importNode(child, true));
-        }
-    }
-
-    private Element findDirectChild(Element parent, String localName) {
-        if (parent == null) {
-            return null;
-        }
-        Node child = parent.getFirstChild();
-        while (child != null) {
-            if (child instanceof Element element
-                && WORDPROCESSING_DRAWING_NS.equals(element.getNamespaceURI())
-                && localName.equals(element.getLocalName())) {
-                return element;
-            }
-            child = child.getNextSibling();
-        }
-        return null;
     }
 
     private ConvertedFile ensureDocx(Path path, List<Path> tempFiles, boolean readOnly) throws IOException {
@@ -1977,7 +1827,6 @@ public class DocxStyleService {
     }
 
     private Path finalizeTarget(ConvertedFile converted, Path userTarget) throws IOException {
-        normalizeImageLayout(converted.effectivePath);
         if (converted.copyBackToOriginal) {
             if (!converted.effectivePath.equals(userTarget)) {
                 Files.copy(converted.effectivePath, userTarget, StandardCopyOption.REPLACE_EXISTING);

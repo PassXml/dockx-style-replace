@@ -9,7 +9,7 @@
         .section { background: #fff; border-radius: 8px; padding: 16px 20px; margin-bottom: 20px; box-shadow: 0 2px 6px rgba(0,0,0,0.08); }
         .section h2 { margin-top: 0; font-size: 18px; }
         label { display: block; margin-top: 10px; font-weight: 600; }
-        input[type="file"], input[type="text"], textarea { width: 100%; margin-top: 6px; }
+        input[type="file"], input[type="text"], select, textarea { width: 100%; margin-top: 6px; }
         button { margin-top: 12px; padding: 8px 16px; border: none; background: #0077ff; color: #fff; border-radius: 4px; cursor: pointer; }
         button:disabled { opacity: 0.6; cursor: not-allowed; }
         .result { margin-top: 10px; padding: 10px; background: #eef3ff; border-radius: 4px; font-size: 14px; }
@@ -95,6 +95,14 @@
         <label>目标文件 (.doc/.docx)
             <input type="file" name="file" accept=".doc,.docx" required>
         </label>
+        <label>DOCX 模板 (.docx，可留空使用内置模板)
+            <input type="file" name="templateFile" accept=".docx">
+        </label>
+        <label>或选择内置模板
+            <select name="templateName" id="format-template-name">
+                <option value="">加载中...</option>
+            </select>
+        </label>
         <div class="result">
             按内置模板样式格式化正文；移除表格样式，首行加粗并填充灰色底纹。
         </div>
@@ -117,6 +125,11 @@
         </label>
         <label>DOCX 模板 (.docx，可留空使用内置模板)
             <input type="file" name="templateFile" accept=".docx">
+        </label>
+        <label>或选择内置模板
+            <select name="templateName" id="template-name">
+                <option value="">加载中...</option>
+            </select>
         </label>
         <div class="result">
             支持标题、段落、有序/无序列表、引用、围栏代码块、Markdown 表格、粗体/斜体/行内代码。
@@ -155,6 +168,37 @@
             return match[1];
         }
         return null;
+    }
+
+    async function loadTemplates() {
+        const selects = [
+            document.getElementById('format-template-name'),
+            document.getElementById('template-name')
+        ].filter(Boolean);
+        try {
+            const response = await fetch(apiBase + '/api/templates');
+            if (!response.ok) {
+                throw new Error('加载模板列表失败');
+            }
+            const data = await response.json();
+            const templates = Array.isArray(data.templates) ? data.templates : [];
+            if (templates.length === 0) {
+                selects.forEach(select => {
+                    select.innerHTML = '<option value="">无可用内置模板</option>';
+                });
+                return;
+            }
+            const options = templates
+                .map(name => `<option value="${name}" ${name === 'template.docx' ? 'selected' : ''}>${name}</option>`)
+                .join('');
+            selects.forEach(select => {
+                select.innerHTML = options;
+            });
+        } catch (err) {
+            selects.forEach(select => {
+                select.innerHTML = '<option value="">加载失败，请改用上传模板</option>';
+            });
+        }
     }
 
     forms.forEach(({id, endpoint, result, type, filename}) => {
@@ -207,6 +251,8 @@
             }
         });
     });
+
+    loadTemplates();
 </script>
 </body>
 </html>

@@ -11,13 +11,18 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.FileSystem;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -62,6 +67,7 @@ public class DocxStyleServer {
 
         app.get("/", this::sendIndex);
         app.get("/index.html", this::sendIndex);
+        app.get("/api/templates", ctx -> ctx.json(Map.of("templates", listTemplates())));
 
         app.post("/api/styles/list", ctx -> {
             Path source = saveUpload(ctx, "file", "list-src", Set.of("doc", "docx"));
@@ -97,7 +103,7 @@ public class DocxStyleServer {
                 throw new BadRequestResponse("缺少上传字段: targetFile");
             }
 
-            Path source = saveUploadOrTemplate(ctx, "sourceFile", "src-");
+            Path source = saveUploadOrTemplate(ctx, "sourceFile", null, "src-");
             StyleSelection selection = resolveStyleSelection(ctx, true);
             boolean copyNumbering = parseBoolean(ctx.formParam("copyNumbering"), true);
             boolean includeDependencies = parseBoolean(ctx.formParam("includeDependencies"), true);
@@ -192,20 +198,22 @@ public class DocxStyleServer {
                 throw new BadRequestResponse("缺少上传字段: file");
             }
             Path target = saveUploadedFile(upload, "format-", Set.of("doc", "docx"));
+            Path template = saveUploadOrTemplate(ctx, "templateFile", "templateName", "format-template-");
             try {
-                Path result = service.formatDocument(target);
+                Path result = service.formatDocument(target, template);
                 sendDocx(ctx, result, buildFormattedFilename(upload.filename()));
                 if (!result.equals(target)) {
                     deleteQuiet(result);
                 }
             } finally {
                 deleteQuiet(target);
+                deleteQuiet(template);
             }
         });
 
         app.post("/api/markdown/convert", ctx -> {
             Path markdown = saveMarkdownInput(ctx, "file", "markdown");
-            Path template = saveUploadOrTemplate(ctx, "templateFile", "md-template-");
+            Path template = saveUploadOrTemplate(ctx, "templateFile", "templateName", "md-template-");
             String title = ctx.formParam("title");
             String sourceName = resolveMarkdownSourceName(ctx.uploadedFile("file"), title);
             try {
@@ -287,10 +295,11 @@ public class DocxStyleServer {
         return candidate;
     }
 
-    private Path saveUploadOrTemplate(Context ctx, String field, String prefix) throws IOException {
+    private Path saveUploadOrTemplate(Context ctx, String field, String templateNameField, String prefix) throws IOException {
         UploadedFile upload = ctx.uploadedFile(field);
         if (upload == null || upload.size() == 0) {
-            return extractTemplate(prefix);
+            String templateName = templateNameField == null ? null : ctx.formParam(templateNameField);
+            return extractTemplate(templateName, prefix);
         }
         return saveUploadedFile(upload, prefix, Set.of("doc", "docx"));
     }
@@ -427,8 +436,8 @@ public class DocxStyleServer {
         return "markdown.md";
     }
 
-    private Path extractTemplate(String prefix) throws IOException {
-        String resourcePath = "/template/template.docx";
+    private Path extractTemplate(String templateName, String prefix) throws IOException {
+        String resourcePath = "/template/" + resolveTemplateName(templateName);
         try (var stream = DocxStyleServer.class.getResourceAsStream(resourcePath)) {
             if (stream == null) {
                 throw new IllegalStateException("找不到内置模板: " + resourcePath);
@@ -437,6 +446,52 @@ public class DocxStyleServer {
             Files.copy(stream, temp, StandardCopyOption.REPLACE_EXISTING);
             return temp;
         }
+    }
+
+    private List<String> listTemplates() throws IOException {
+        try {
+            var resource = DocxStyleServer.class.getResource("/template");
+            if (resource == null) {
+                throw new IllegalStateException("template resource not found");
+            }
+            URI uri = resource.toURI();
+            if ("jar".equalsIgnoreCase(uri.getScheme())) {
+                try (FileSystem fileSystem = FileSystems.newFileSystem(uri, Map.of())) {
+                    return listTemplateNames(fileSystem.getPath("/template"));
+                }
+            }
+            return listTemplateNames(Paths.get(uri));
+        } catch (Exception ex) {
+            throw new IOException("Failed to list templates", ex);
+        }
+    }
+
+    private List<String> listTemplateNames(Path templateDir) throws IOException {
+        List<String> names = new ArrayList<>();
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(templateDir, "*.docx")) {
+            for (Path path : stream) {
+                if (Files.isRegularFile(path)) {
+                    names.add(path.getFileName().toString());
+                }
+            }
+        }
+        names.sort(Comparator.naturalOrder());
+        return names;
+    }
+
+    private String resolveTemplateName(String templateName) throws IOException {
+        List<String> templates = listTemplates();
+        if (templates.isEmpty()) {
+            throw new IllegalStateException("No template file found");
+        }
+        if (templateName == null || templateName.isBlank()) {
+            return templates.contains("template.docx") ? "template.docx" : templates.get(0);
+        }
+        String normalizedName = Paths.get(templateName).getFileName().toString();
+        if (!templates.contains(normalizedName)) {
+            throw new BadRequestResponse("Template not found: " + normalizedName);
+        }
+        return normalizedName;
     }
 
     private String readClasspathResource(String resourcePath) throws IOException {

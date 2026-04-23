@@ -749,7 +749,7 @@ public class DocxStyleService {
         // 4. 逐个单元格清理段落直设格式，再套用模板里的表头/表体样式。
         removeTableStyle(table);
         table.setTableAlignment(TableRowAlign.CENTER);
-        table.setCellMargins(0, 108, 0, 108);
+        table.setCellMargins(0, 0, 0, 0);
         applyAutoFitWidth(table, availablePageWidth);
         applyTableBorders(table);
         List<XWPFTableRow> rows = table.getRows();
@@ -846,8 +846,8 @@ public class DocxStyleService {
                 paragraph.setSpacingBefore(0);
                 paragraph.setSpacingAfter(0);
                 paragraph.setSpacingBetween(1.0d);
-                paragraph.setIndentationFirstLine(0);
                 paragraph.setStyle(headerRow ? templateStyles.tableHeaderStyleId() : templateStyles.tableBodyStyleId());
+                applyZeroParagraphIndentation(paragraph);
                 for (XWPFRun run : paragraph.getRuns()) {
                     clearRunDirectFormatting(run);
                 }
@@ -1100,6 +1100,9 @@ public class DocxStyleService {
             // 某些源文档标题段落会带直接编号。
             // 如果保留下来，套用模板标题样式后可能出现“标题前多出编号”的副作用。
             clearDirectParagraphNumbering(paragraph);
+            // 仅清编号还不够，源文档常会把编号缩进直接写在段落上。
+            // 如果不一起清掉，重新套用模板编号后会出现标题缩进错乱。
+            applyZeroParagraphIndentation(paragraph);
         }
         paragraph.setStyle(styleId);
     }
@@ -1206,7 +1209,7 @@ public class DocxStyleService {
             if (text == null || text.isEmpty()) {
                 continue;
             }
-            String cleaned = text.replaceFirst("^[\\t\\u00A0 ]+", "");
+            String cleaned = text.replaceFirst("^[\\t\\u00A0\\u3000 ]+", "");
             if (!cleaned.equals(text)) {
                 run.setText(cleaned, 0);
             }
@@ -1214,6 +1217,30 @@ public class DocxStyleService {
                 return;
             }
         }
+    }
+
+    private void clearParagraphIndentation(XWPFParagraph paragraph) {
+        if (paragraph.getCTP().getPPr() == null || !paragraph.getCTP().getPPr().isSetInd()) {
+            return;
+        }
+        paragraph.getCTP().getPPr().unsetInd();
+    }
+
+    private void applyZeroParagraphIndentation(XWPFParagraph paragraph) {
+        clearParagraphIndentation(paragraph);
+        paragraph.setIndentationFirstLine(0);
+        paragraph.setIndentationLeft(0);
+        paragraph.setIndentationHanging(0);
+        CTPPr properties = paragraph.getCTP().isSetPPr() ? paragraph.getCTP().getPPr() : paragraph.getCTP().addNewPPr();
+        CTInd indentation = properties.isSetInd() ? properties.getInd() : properties.addNewInd();
+        indentation.setLeft(BigInteger.ZERO);
+        indentation.setRight(BigInteger.ZERO);
+        indentation.setFirstLine(BigInteger.ZERO);
+        indentation.setHanging(BigInteger.ZERO);
+        indentation.setLeftChars(BigInteger.ZERO);
+        indentation.setRightChars(BigInteger.ZERO);
+        indentation.setFirstLineChars(BigInteger.ZERO);
+        indentation.setHangingChars(BigInteger.ZERO);
     }
 
     private Path extractBuiltinTemplate(List<Path> tempFiles) throws IOException {

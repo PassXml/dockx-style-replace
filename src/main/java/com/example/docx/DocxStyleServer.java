@@ -193,21 +193,144 @@ public class DocxStyleServer {
         });
 
         app.post("/api/styles/format", ctx -> {
-            UploadedFile upload = ctx.uploadedFile("file");
-            if (upload == null) {
-                throw new BadRequestResponse("缺少上传字段: file");
+            List<UploadedFile> uploads = ctx.uploadedFiles("file");
+            if (uploads == null || uploads.isEmpty()) {
+                throw new BadRequestResponse("Missing upload field: file");
             }
-            Path target = saveUploadedFile(upload, "format-", Set.of("doc", "docx"));
+
             Path template = saveUploadOrTemplate(ctx, "templateFile", "templateName", "format-template-");
+            if (uploads.size() == 1) {
+                UploadedFile upload = uploads.get(0);
+                Path target = saveUploadedFile(upload, "format-", Set.of("doc", "docx"));
+                try {
+                    boolean cleanAllStyles = parseBoolean(ctx.formParam("cleanAllStyles"), true);
+                    Path result = service.formatDocument(target, template, cleanAllStyles);
+                    sendDocx(ctx, result, buildFormattedFilename(upload.filename()));
+                    if (!result.equals(target)) {
+                        deleteQuiet(result);
+                    }
+                } finally {
+                    deleteQuiet(target);
+                    deleteQuiet(template);
+                }
+                return;
+            }
+
+            List<Path> targets = new ArrayList<>();
+            List<Path> results = new ArrayList<>();
+            List<String> originalNames = new ArrayList<>();
+            Path zip = null;
             try {
-                Path result = service.formatDocument(target, template);
-                sendDocx(ctx, result, buildFormattedFilename(upload.filename()));
-                if (!result.equals(target)) {
+                boolean cleanAllStyles = parseBoolean(ctx.formParam("cleanAllStyles"), true);
+                for (UploadedFile upload : uploads) {
+                    if (upload == null || upload.size() == 0) {
+                        continue;
+                    }
+                    Path target = saveUploadedFile(upload, "format-", Set.of("doc", "docx"));
+                    targets.add(target);
+                    originalNames.add(buildFormattedFilename(upload.filename()));
+                    results.add(service.formatDocument(target, template, cleanAllStyles));
+                }
+
+                if (results.isEmpty()) {
+                    throw new BadRequestResponse("No valid target document uploaded.");
+                }
+
+                zip = Files.createTempFile(workDir, "formatted-", ".zip");
+                try (OutputStream out = Files.newOutputStream(zip);
+                     ZipOutputStream zos = new ZipOutputStream(out)) {
+                    Set<String> usedNames = new LinkedHashSet<>();
+                    for (int i = 0; i < results.size(); i++) {
+                        String entryName = ensureUniqueName(originalNames.get(i), usedNames);
+                        zos.putNextEntry(new ZipEntry(entryName));
+                        try (InputStream in = Files.newInputStream(results.get(i))) {
+                            in.transferTo(zos);
+                        }
+                        zos.closeEntry();
+                    }
+                }
+
+                sendZip(ctx, zip, "formatted.zip");
+            } finally {
+                deleteQuiet(template);
+                for (int i = 0; i < results.size(); i++) {
+                    Path result = results.get(i);
+                    Path target = i < targets.size() ? targets.get(i) : null;
+                    if (result != null && !result.equals(target)) {
+                        deleteQuiet(result);
+                    }
+                }
+                for (Path target : targets) {
+                    deleteQuiet(target);
+                }
+                deleteQuiet(zip);
+            }
+        });
+
+        app.post("/api/styles/rebuild", ctx -> {
+            List<UploadedFile> uploads = ctx.uploadedFiles("file");
+            if (uploads == null || uploads.isEmpty()) {
+                throw new BadRequestResponse("Missing upload field: file");
+            }
+
+            Path template = saveUploadOrTemplate(ctx, "templateFile", "templateName", "rebuild-template-");
+            if (uploads.size() == 1) {
+                UploadedFile upload = uploads.get(0);
+                Path target = saveUploadedFile(upload, "rebuild-", Set.of("doc", "docx"));
+                try {
+                    Path result = service.rebuildDocumentIntoTemplate(target, template);
+                    sendDocx(ctx, result, buildRebuiltFilename(upload.filename()));
+                    deleteQuiet(result);
+                } finally {
+                    deleteQuiet(target);
+                    deleteQuiet(template);
+                }
+                return;
+            }
+
+            List<Path> targets = new ArrayList<>();
+            List<Path> results = new ArrayList<>();
+            List<String> originalNames = new ArrayList<>();
+            Path zip = null;
+            try {
+                for (UploadedFile upload : uploads) {
+                    if (upload == null || upload.size() == 0) {
+                        continue;
+                    }
+                    Path target = saveUploadedFile(upload, "rebuild-", Set.of("doc", "docx"));
+                    targets.add(target);
+                    originalNames.add(buildRebuiltFilename(upload.filename()));
+                    results.add(service.rebuildDocumentIntoTemplate(target, template));
+                }
+
+                if (results.isEmpty()) {
+                    throw new BadRequestResponse("No valid target document uploaded.");
+                }
+
+                zip = Files.createTempFile(workDir, "rebuilt-", ".zip");
+                try (OutputStream out = Files.newOutputStream(zip);
+                     ZipOutputStream zos = new ZipOutputStream(out)) {
+                    Set<String> usedNames = new LinkedHashSet<>();
+                    for (int i = 0; i < results.size(); i++) {
+                        String entryName = ensureUniqueName(originalNames.get(i), usedNames);
+                        zos.putNextEntry(new ZipEntry(entryName));
+                        try (InputStream in = Files.newInputStream(results.get(i))) {
+                            in.transferTo(zos);
+                        }
+                        zos.closeEntry();
+                    }
+                }
+
+                sendZip(ctx, zip, "rebuilt.zip");
+            } finally {
+                deleteQuiet(template);
+                for (Path result : results) {
                     deleteQuiet(result);
                 }
-            } finally {
-                deleteQuiet(target);
-                deleteQuiet(template);
+                for (Path target : targets) {
+                    deleteQuiet(target);
+                }
+                deleteQuiet(zip);
             }
         });
 
@@ -228,12 +351,11 @@ public class DocxStyleServer {
 
         app.post("/api/styles/clean", ctx -> {
             Path target = saveUpload(ctx, "file", "clean-", Set.of("doc", "docx"));
-            StyleSelection selection = resolveStyleSelection(ctx, false);
-            if (selection.allStyles()) {
-                throw new BadRequestResponse("清理操作不支持通配符 *");
-            }
             try {
-                DocxStyleService.CleanResult result = service.cleanStyles(target, selection.names());
+                boolean cleanAllStyles = parseBoolean(ctx.formParam("cleanAllStyles"), false);
+                DocxStyleService.CleanResult result = cleanAllStyles
+                    ? service.cleanAllStyles(target)
+                    : service.cleanStyles(target, resolveStyleSelection(ctx, false).names());
                 ctx.header("X-Removed-Count", Integer.toString(result.removed()));
                 sendDocx(ctx, result.file(), "cleaned.docx");
                 if (!result.file().equals(target)) {
@@ -417,6 +539,15 @@ public class DocxStyleServer {
         return baseName + "_已格式化.docx";
     }
 
+    private String buildRebuiltFilename(String originalName) {
+        String safeName = safeOriginalName(originalName);
+        String baseName = FilenameUtils.getBaseName(safeName);
+        if (baseName == null || baseName.isBlank()) {
+            baseName = "document";
+        }
+        return baseName + "_内容注入模板.docx";
+    }
+
     private String buildMarkdownFilename(String originalName) {
         String safeName = safeOriginalName(originalName);
         String baseName = FilenameUtils.getBaseName(safeName);
@@ -552,7 +683,7 @@ public class DocxStyleServer {
         if (value == null || value.isBlank()) {
             return defaultValue;
         }
-        if ("true".equalsIgnoreCase(value) || "y".equalsIgnoreCase(value) || "yes".equalsIgnoreCase(value)) {
+        if ("true".equalsIgnoreCase(value) || "y".equalsIgnoreCase(value) || "yes".equalsIgnoreCase(value) || "on".equalsIgnoreCase(value)) {
             return true;
         }
         if ("false".equalsIgnoreCase(value) || "n".equalsIgnoreCase(value) || "no".equalsIgnoreCase(value)) {

@@ -84,6 +84,9 @@
         <label>或上传样式清单文件
             <input type="file" name="stylesFile" accept=".txt,.csv">
         </label>
+        <label>
+            <input type="checkbox" name="cleanAllStyles"> &#28165;&#29702;&#24403;&#21069;&#25991;&#26723;&#25152;&#26377;&#26679;&#24335;
+        </label>
         <button type="submit">执行清理</button>
     </form>
     <div class="result" id="clean-result"></div>
@@ -93,7 +96,7 @@
     <h2>5. 文档格式化</h2>
     <form id="format-form">
         <label>目标文件 (.doc/.docx)
-            <input type="file" name="file" accept=".doc,.docx" required>
+            <input type="file" name="file" accept=".doc,.docx" multiple required>
         </label>
         <label>DOCX 模板 (.docx，可留空使用内置模板)
             <input type="file" name="templateFile" accept=".docx">
@@ -103,10 +106,14 @@
                 <option value="">加载中...</option>
             </select>
         </label>
+        <label>
+            <input type="checkbox" name="cleanAllStyles" checked> &#26684;&#24335;&#21270;&#21069;&#20808;&#28165;&#29702;&#24403;&#21069;&#25991;&#26723;&#25152;&#26377;&#26679;&#24335;
+        </label>
         <div class="result">
-            按内置模板样式格式化正文；移除表格样式，首行加粗并填充灰色底纹。
+            “执行格式化”会在原文档容器内重设模板样式；“内容注入模板”会复制文字、表格、图片和目录等正文内容到干净模板容器，再生成下载文件。
         </div>
         <button type="submit">执行格式化</button>
+        <button type="submit" data-endpoint="/api/styles/rebuild">内容注入模板</button>
     </form>
     <div class="result" id="format-result"></div>
 </div>
@@ -209,8 +216,11 @@
             output.textContent = '处理中...';
             output.classList.remove('error');
             const formData = new FormData(form);
+            const submitter = e.submitter;
+            const activeEndpoint = submitter?.dataset.endpoint || endpoint;
+            const activeFilename = submitter?.dataset.filename || filename;
             try {
-                const response = await fetch(apiBase + endpoint, {
+                const response = await fetch(apiBase + activeEndpoint, {
                     method: 'POST',
                     body: formData
                 });
@@ -227,7 +237,7 @@
                     const url = URL.createObjectURL(blob);
                     const link = document.createElement('a');
                     link.href = url;
-                    let downloadName = filename;
+                    let downloadName = activeFilename;
                     if (!downloadName) {
                         const disposition = response.headers.get('Content-Disposition') || response.headers.get('content-disposition');
                         downloadName = extractFilename(disposition) || 'result';

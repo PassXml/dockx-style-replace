@@ -45,6 +45,7 @@ import org.openxmlformats.schemas.wordprocessingml.x2006.main.STNumberFormat;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STTblWidth;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.w3c.dom.Attr;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
@@ -76,8 +77,14 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
+import java.util.zip.ZipOutputStream;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.transform.OutputKeys;
+import javax.xml.transform.Transformer;
+import javax.xml.transform.TransformerFactory;
+import javax.xml.transform.dom.DOMSource;
+import javax.xml.transform.stream.StreamResult;
 
 /**
  * 提供样式迁移、导出、清理与文档格式化的核心服务。
@@ -93,6 +100,11 @@ import javax.xml.parsers.DocumentBuilderFactory;
 public class DocxStyleService {
 
     private static final String WORDPROCESSINGML_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    private static final String RELATIONSHIPS_NS = "http://schemas.openxmlformats.org/package/2006/relationships";
+    private static final String OFFICE_RELATIONSHIPS_NS =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    private static final String CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types";
+    private static final BigInteger DEFAULT_TAB_STOP_TWO_CHARS = BigInteger.valueOf(420);
     private static final Pattern MARKDOWN_HEADING = Pattern.compile("^(#{1,6})\\s+(.*)$");
     private static final Pattern MARKDOWN_BULLET = Pattern.compile("^(\\s*)[-+*]\\s+(.*)$");
     private static final Pattern MARKDOWN_ORDERED = Pattern.compile("^(\\s*)(\\d+)\\.\\s+(.*)$");
@@ -152,6 +164,20 @@ public class DocxStyleService {
         }
     }
 
+    public CleanResult cleanAllStyles(Path document) throws Exception {
+        List<StyleInfo> styles = listStyles(document);
+        Set<String> styleIds = styles.stream()
+            .map(StyleInfo::styleId)
+            .filter(Objects::nonNull)
+            .map(String::trim)
+            .filter(id -> !id.isEmpty())
+            .collect(Collectors.toCollection(LinkedHashSet::new));
+        if (styleIds.isEmpty()) {
+            throw new IllegalArgumentException("No removable styles found in document");
+        }
+        return cleanStyles(document, styleIds);
+    }
+
     public Path formatDocument(Path document) throws Exception {
         List<Path> tempFiles = new ArrayList<>();
         try {
@@ -163,19 +189,44 @@ public class DocxStyleService {
     }
 
     public Path formatDocument(Path document, Path template) throws Exception {
+        return formatDocument(document, template, true);
+    }
+
+    public Path formatDocument(Path document, Path template, boolean cleanAllStyles) throws Exception {
         List<Path> tempFiles = new ArrayList<>();
         ConvertedFile target = ensureDocx(document, tempFiles, false);
         try {
-            // 先使用指定模板，再把模板中的样式定义整体复制到目标文档，
-            // 最后基于“原始段落样式名 -> 模板样式 ID”的映射逐段重设格式。
+            // 先保留原文样式名与编号快照，再把模板样式同步到目标文档，
+            // 最后基于“原样式名 -> 模板样式”的映射重设正文与表格。
             Map<String, String> originalStyleNames = readParagraphStyleNames(target.effectivePath);
             List<ParagraphNumberingSnapshot> originalParagraphNumbering =
                 readParagraphNumberingSnapshots(target.effectivePath);
             TemplateStyleSet templateStyles = loadTemplateStyleSet(template);
-            transferAllStyles(template, target.effectivePath, true);
+            if (cleanAllStyles) {
+                transferAllStyles(template, target.effectivePath, true);
+            } else {
+                mergeAllStyles(template, target.effectivePath, true);
+            }
             applyDocumentFormat(target.effectivePath, template, originalStyleNames, originalParagraphNumbering,
                 templateStyles);
             return finalizeTarget(target, document);
+        } finally {
+            cleanupTemps(tempFiles);
+        }
+    }
+
+    public Path rebuildDocumentIntoTemplate(Path document, Path template) throws Exception {
+        List<Path> tempFiles = new ArrayList<>();
+        ConvertedFile source = ensureDocx(document, tempFiles, true);
+        try {
+            Map<String, String> originalStyleNames = readParagraphStyleNames(source.effectivePath);
+            List<ParagraphNumberingSnapshot> originalParagraphNumbering =
+                readParagraphNumberingSnapshots(source.effectivePath);
+            TemplateStyleSet templateStyles = loadTemplateStyleSet(template);
+            Path rebuilt = Files.createTempFile("docx-rebuild-", ".docx");
+            rebuildBodyIntoTemplate(source.effectivePath, template, rebuilt);
+            applyDocumentFormat(rebuilt, template, originalStyleNames, originalParagraphNumbering, templateStyles);
+            return rebuilt;
         } finally {
             cleanupTemps(tempFiles);
         }
@@ -236,6 +287,64 @@ public class DocxStyleService {
             copyNumberingPart(srcMain, dstMain);
         }
         dstPkg.save(dstDocx.toFile());
+    }
+
+    private void mergeAllStyles(Path srcDocx, Path dstDocx, boolean copyNumbering) throws Docx4JException {
+        WordprocessingMLPackage srcPkg = WordprocessingMLPackage.load(srcDocx.toFile());
+        WordprocessingMLPackage dstPkg = WordprocessingMLPackage.load(dstDocx.toFile());
+        MainDocumentPart srcMain = srcPkg.getMainDocumentPart();
+        MainDocumentPart dstMain = dstPkg.getMainDocumentPart();
+        StyleDefinitionsPart srcStylePart = Optional.ofNullable(srcMain.getStyleDefinitionsPart())
+            .orElseThrow(() -> new IllegalStateException("???????????????"));
+        StyleDefinitionsPart dstStylePart = dstMain.getStyleDefinitionsPart(true);
+
+        List<Style> dstList = dstStylePart.getJaxbElement().getStyle();
+        Set<String> srcStyleIds = srcStylePart.getJaxbElement().getStyle().stream()
+            .map(Style::getStyleId)
+            .filter(Objects::nonNull)
+            .collect(Collectors.toSet());
+        dstList.removeIf(style -> srcStyleIds.contains(style.getStyleId()));
+        for (Style style : srcStylePart.getJaxbElement().getStyle()) {
+            dstList.add(XmlUtils.deepCopy(style));
+        }
+        syncLatentAndDefaults(srcStylePart, dstStylePart);
+        if (copyNumbering) {
+            copyNumberingPart(srcMain, dstMain);
+        }
+        dstPkg.save(dstDocx.toFile());
+    }
+
+    private void rebuildBodyIntoTemplate(Path sourceDocx, Path templateDocx, Path outputDocx) throws IOException {
+        Map<String, byte[]> sourceEntries = readZipEntries(sourceDocx);
+        Map<String, byte[]> templateEntries = readZipEntries(templateDocx);
+
+        Document sourceDocument = parseXml(sourceEntries.get("word/document.xml"));
+        Document templateDocument = parseXml(templateEntries.get("word/document.xml"));
+        Document sourceRelationships = parseXml(sourceEntries.get("word/_rels/document.xml.rels"));
+        Document templateRelationships = parseXml(templateEntries.get("word/_rels/document.xml.rels"));
+        Document sourceContentTypes = parseXml(sourceEntries.get("[Content_Types].xml"));
+        Document templateContentTypes = parseXml(templateEntries.get("[Content_Types].xml"));
+
+        Element sourceBody = firstElement(sourceDocument, WORDPROCESSINGML_NS, "body");
+        Element templateBody = firstElement(templateDocument, WORDPROCESSINGML_NS, "body");
+        if (sourceBody == null || templateBody == null) {
+            throw new IOException("文档正文结构无效，无法重建到模板");
+        }
+
+        Map<String, RelationshipInfo> sourceRelationshipMap = readRelationships(sourceRelationships);
+        Map<String, String> relationshipIdMapping = new LinkedHashMap<>();
+        Map<String, byte[]> extraEntries = new LinkedHashMap<>();
+        copyReferencedBodyRelationships(sourceBody, sourceRelationshipMap, sourceEntries, sourceContentTypes,
+            templateEntries, templateRelationships, templateContentTypes, relationshipIdMapping, extraEntries);
+        remapRelationshipReferences(sourceBody, relationshipIdMapping);
+        replaceTemplateBody(templateDocument, templateBody, sourceBody);
+
+        Map<String, byte[]> outputEntries = new LinkedHashMap<>(templateEntries);
+        outputEntries.putAll(extraEntries);
+        outputEntries.put("word/document.xml", toXmlBytes(templateDocument));
+        outputEntries.put("word/_rels/document.xml.rels", toXmlBytes(templateRelationships));
+        outputEntries.put("[Content_Types].xml", toXmlBytes(templateContentTypes));
+        writeZipEntries(outputDocx, outputEntries);
     }
 
     public List<StyleInfo> listStyles(Path document) throws Exception {
@@ -324,6 +433,7 @@ public class DocxStyleService {
                 document.write(out);
             }
         }
+        applyDefaultTabStop(docxPath);
     }
 
     private void applyTemplateSectionProperties(XWPFDocument document, XWPFDocument templateDocument) {
@@ -332,6 +442,27 @@ public class DocxStyleService {
             return;
         }
         document.getDocument().getBody().setSectPr((CTSectPr) templateSectPr.copy());
+    }
+
+    private void applyDefaultTabStop(Path docxPath) throws IOException {
+        Map<String, byte[]> entries = readZipEntries(docxPath);
+        byte[] settingsBytes = entries.get("word/settings.xml");
+        if (settingsBytes == null || settingsBytes.length == 0) {
+            return;
+        }
+        Document settingsDocument = parseXml(settingsBytes);
+        Element settingsRoot = settingsDocument.getDocumentElement();
+        if (settingsRoot == null) {
+            return;
+        }
+        Element defaultTabStop = findDirectChild(settingsRoot, WORDPROCESSINGML_NS, "defaultTabStop");
+        if (defaultTabStop == null) {
+            defaultTabStop = settingsDocument.createElementNS(WORDPROCESSINGML_NS, "w:defaultTabStop");
+            settingsRoot.appendChild(defaultTabStop);
+        }
+        defaultTabStop.setAttributeNS(WORDPROCESSINGML_NS, "w:val", DEFAULT_TAB_STOP_TWO_CHARS.toString());
+        entries.put("word/settings.xml", toXmlBytes(settingsDocument));
+        writeZipEntries(docxPath, entries);
     }
 
     private void renderMarkdownDocument(XWPFDocument document,
@@ -876,7 +1007,8 @@ public class DocxStyleService {
         boolean headerRow) {
         for (IBodyElement bodyElement : cell.getBodyElements()) {
             if (bodyElement instanceof XWPFParagraph paragraph) {
-                nextParagraphNumberingSnapshot(originalParagraphNumbering, traversalState);
+                ParagraphNumberingSnapshot numberingSnapshot =
+                    nextParagraphNumberingSnapshot(originalParagraphNumbering, traversalState);
                 // 单元格里的段落常常带有来源文档残留的边框、缩进、行距、run 直设格式。
                 // 这里先“去直设”，再统一回到模板样式，避免看起来像是样式复制失败。
                 clearParagraphBorders(paragraph);
@@ -887,6 +1019,9 @@ public class DocxStyleService {
                 String tableStyleId = headerRow ? templateStyles.tableHeaderStyleId() : templateStyles.tableBodyStyleId();
                 if (tableStyleId != null && !tableStyleId.isBlank()) {
                     paragraph.setStyle(tableStyleId);
+                }
+                if (bodyListNumbering != null && numberingSnapshot.hasDirectNumbering()) {
+                    applyIsolatedBodyListNumbering(paragraph, numberingSnapshot, bodyListNumbering);
                 }
                 applyZeroParagraphIndentation(paragraph);
                 for (XWPFRun run : paragraph.getRuns()) {
@@ -1151,6 +1286,9 @@ public class DocxStyleService {
             clearParagraphIndentation(paragraph);
         }
         paragraph.setStyle(styleId);
+        for (XWPFRun run : paragraph.getRuns()) {
+            clearRunDirectFormatting(run);
+        }
         if (containsDrawing(paragraph)) {
             normalizeDrawingParagraphLayout(paragraph);
         }
@@ -1592,6 +1730,311 @@ public class DocxStyleService {
         return null;
     }
 
+    private Map<String, byte[]> readZipEntries(Path docxPath) throws IOException {
+        Map<String, byte[]> entries = new LinkedHashMap<>();
+        try (ZipInputStream zipIn = new ZipInputStream(Files.newInputStream(docxPath))) {
+            ZipEntry entry;
+            while ((entry = zipIn.getNextEntry()) != null) {
+                if (!entry.isDirectory()) {
+                    entries.put(entry.getName(), zipIn.readAllBytes());
+                }
+            }
+        }
+        return entries;
+    }
+
+    private void writeZipEntries(Path docxPath, Map<String, byte[]> entries) throws IOException {
+        try (OutputStream out = Files.newOutputStream(docxPath);
+             ZipOutputStream zipOut = new ZipOutputStream(out)) {
+            for (Map.Entry<String, byte[]> entry : entries.entrySet()) {
+                zipOut.putNextEntry(new ZipEntry(entry.getKey()));
+                zipOut.write(entry.getValue());
+                zipOut.closeEntry();
+            }
+        }
+    }
+
+    private Document parseXml(byte[] bytes) throws IOException {
+        if (bytes == null || bytes.length == 0) {
+            throw new IOException("缺少必要的 XML 部件");
+        }
+        try {
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            factory.setNamespaceAware(true);
+            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            return factory.newDocumentBuilder().parse(new ByteArrayInputStream(bytes));
+        } catch (Exception ex) {
+            throw new IOException("解析 XML 部件失败", ex);
+        }
+    }
+
+    private byte[] toXmlBytes(Document document) throws IOException {
+        try {
+            TransformerFactory transformerFactory = TransformerFactory.newInstance();
+            transformerFactory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            Transformer transformer = transformerFactory.newTransformer();
+            transformer.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "no");
+            transformer.setOutputProperty(OutputKeys.ENCODING, StandardCharsets.UTF_8.name());
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            transformer.transform(new DOMSource(document), new StreamResult(out));
+            return out.toByteArray();
+        } catch (Exception ex) {
+            throw new IOException("序列化 XML 部件失败", ex);
+        }
+    }
+
+    private void copyReferencedBodyRelationships(Element sourceBody,
+        Map<String, RelationshipInfo> sourceRelationshipMap,
+        Map<String, byte[]> sourceEntries,
+        Document sourceContentTypes,
+        Map<String, byte[]> templateEntries,
+        Document templateRelationships,
+        Document templateContentTypes,
+        Map<String, String> relationshipIdMapping,
+        Map<String, byte[]> extraEntries) {
+        Set<String> usedRelationshipIds = new LinkedHashSet<>(readRelationships(templateRelationships).keySet());
+        Set<String> usedEntryNames = new LinkedHashSet<>(templateEntries.keySet());
+        for (String sourceRelationshipId : collectRelationshipReferences(sourceBody)) {
+            RelationshipInfo relationship = sourceRelationshipMap.get(sourceRelationshipId);
+            if (relationship == null || relationshipIdMapping.containsKey(sourceRelationshipId)) {
+                continue;
+            }
+            String targetRelationshipId = nextRelationshipId(usedRelationshipIds);
+            if (relationship.external()) {
+                relationshipIdMapping.put(sourceRelationshipId, targetRelationshipId);
+                appendRelationship(templateRelationships, targetRelationshipId, relationship.type(), relationship.target(), true);
+                continue;
+            }
+
+            String sourceEntryName = resolveZipTarget("word/document.xml", relationship.target());
+            byte[] sourceEntryBytes = sourceEntries.get(sourceEntryName);
+            if (sourceEntryBytes == null) {
+                continue;
+            }
+            String targetEntryName = nextZipEntryName(sourceEntryName, usedEntryNames);
+            extraEntries.put(targetEntryName, sourceEntryBytes);
+            ensureContentType(templateContentTypes, sourceContentTypes, targetEntryName);
+            relationshipIdMapping.put(sourceRelationshipId, targetRelationshipId);
+            appendRelationship(templateRelationships, targetRelationshipId, relationship.type(),
+                relativizeZipTarget("word/document.xml", targetEntryName), false);
+        }
+    }
+
+    private Set<String> collectRelationshipReferences(Element root) {
+        Set<String> references = new LinkedHashSet<>();
+        collectRelationshipReferences(root, references);
+        return references;
+    }
+
+    private void collectRelationshipReferences(Node node, Set<String> references) {
+        if (node instanceof Element element) {
+            for (int index = 0; index < element.getAttributes().getLength(); index++) {
+                Node attribute = element.getAttributes().item(index);
+                if (!(attribute instanceof Attr attr)) {
+                    continue;
+                }
+                if (!OFFICE_RELATIONSHIPS_NS.equals(attr.getNamespaceURI())) {
+                    continue;
+                }
+                String localName = attr.getLocalName();
+                if ("id".equals(localName) || "embed".equals(localName) || "link".equals(localName)) {
+                    String value = attr.getValue();
+                    if (value != null && !value.isBlank()) {
+                        references.add(value.trim());
+                    }
+                }
+            }
+        }
+        Node child = node.getFirstChild();
+        while (child != null) {
+            collectRelationshipReferences(child, references);
+            child = child.getNextSibling();
+        }
+    }
+
+    private Map<String, RelationshipInfo> readRelationships(Document relationshipsDocument) {
+        Map<String, RelationshipInfo> relationships = new LinkedHashMap<>();
+        Element root = relationshipsDocument.getDocumentElement();
+        Node child = root.getFirstChild();
+        while (child != null) {
+            if (child instanceof Element element && "Relationship".equals(element.getLocalName())) {
+                String id = element.getAttribute("Id");
+                String type = element.getAttribute("Type");
+                String target = element.getAttribute("Target");
+                boolean external = "External".equalsIgnoreCase(element.getAttribute("TargetMode"));
+                if (id != null && !id.isBlank()) {
+                    relationships.put(id, new RelationshipInfo(id, type, target, external));
+                }
+            }
+            child = child.getNextSibling();
+        }
+        return relationships;
+    }
+
+    private void appendRelationship(Document relationshipsDocument,
+        String id,
+        String type,
+        String target,
+        boolean external) {
+        Element relationship = relationshipsDocument.createElementNS(RELATIONSHIPS_NS, "Relationship");
+        relationship.setAttribute("Id", id);
+        relationship.setAttribute("Type", type);
+        relationship.setAttribute("Target", target);
+        if (external) {
+            relationship.setAttribute("TargetMode", "External");
+        }
+        relationshipsDocument.getDocumentElement().appendChild(relationship);
+    }
+
+    private void remapRelationshipReferences(Element sourceBody, Map<String, String> relationshipIdMapping) {
+        remapRelationshipReferences((Node) sourceBody, relationshipIdMapping);
+    }
+
+    private void remapRelationshipReferences(Node node, Map<String, String> relationshipIdMapping) {
+        if (node instanceof Element element) {
+            for (int index = 0; index < element.getAttributes().getLength(); index++) {
+                Node attribute = element.getAttributes().item(index);
+                if (!(attribute instanceof Attr attr)) {
+                    continue;
+                }
+                if (!OFFICE_RELATIONSHIPS_NS.equals(attr.getNamespaceURI())) {
+                    continue;
+                }
+                String mapped = relationshipIdMapping.get(attr.getValue());
+                if (mapped != null) {
+                    attr.setValue(mapped);
+                }
+            }
+        }
+        Node child = node.getFirstChild();
+        while (child != null) {
+            remapRelationshipReferences(child, relationshipIdMapping);
+            child = child.getNextSibling();
+        }
+    }
+
+    private void replaceTemplateBody(Document templateDocument, Element templateBody, Element sourceBody) {
+        Node templateSectionProperties = findDirectChild(templateBody, WORDPROCESSINGML_NS, "sectPr");
+        Node sectionCopy = templateSectionProperties == null ? null : templateDocument.importNode(templateSectionProperties, true);
+        while (templateBody.hasChildNodes()) {
+            templateBody.removeChild(templateBody.getFirstChild());
+        }
+        Node child = sourceBody.getFirstChild();
+        while (child != null) {
+            Node next = child.getNextSibling();
+            if (!(child instanceof Element element) || !"sectPr".equals(element.getLocalName())) {
+                templateBody.appendChild(templateDocument.importNode(child, true));
+            }
+            child = next;
+        }
+        if (sectionCopy != null) {
+            templateBody.appendChild(sectionCopy);
+        }
+    }
+
+    private void ensureContentType(Document templateContentTypes, Document sourceContentTypes, String targetEntryName) {
+        String partName = "/" + targetEntryName;
+        if (containsOverride(templateContentTypes, partName)) {
+            return;
+        }
+        Element sourceOverride = findContentTypeElement(sourceContentTypes, "Override", "PartName", partName);
+        if (sourceOverride != null) {
+            templateContentTypes.getDocumentElement().appendChild(
+                templateContentTypes.importNode(sourceOverride, true));
+            return;
+        }
+
+        String extension = FilenameUtils.getExtension(targetEntryName);
+        if (extension == null || extension.isBlank() || containsDefault(templateContentTypes, extension)) {
+            return;
+        }
+        Element sourceDefault = findContentTypeElement(sourceContentTypes, "Default", "Extension", extension);
+        if (sourceDefault != null) {
+            templateContentTypes.getDocumentElement().appendChild(
+                templateContentTypes.importNode(sourceDefault, true));
+        }
+    }
+
+    private boolean containsOverride(Document document, String partName) {
+        return findContentTypeElement(document, "Override", "PartName", partName) != null;
+    }
+
+    private boolean containsDefault(Document document, String extension) {
+        return findContentTypeElement(document, "Default", "Extension", extension) != null;
+    }
+
+    private Element findContentTypeElement(Document document, String localName, String attributeName, String value) {
+        Node child = document.getDocumentElement().getFirstChild();
+        while (child != null) {
+            if (child instanceof Element element && localName.equals(element.getLocalName())
+                && value.equalsIgnoreCase(element.getAttribute(attributeName))) {
+                return element;
+            }
+            child = child.getNextSibling();
+        }
+        return null;
+    }
+
+    private Element firstElement(Document document, String namespaceUri, String localName) {
+        NodeList elements = document.getElementsByTagNameNS(namespaceUri, localName);
+        if (elements.getLength() == 0 || !(elements.item(0) instanceof Element element)) {
+            return null;
+        }
+        return element;
+    }
+
+    private String nextRelationshipId(Set<String> usedRelationshipIds) {
+        int index = 1;
+        while (usedRelationshipIds.contains("rId" + index)) {
+            index++;
+        }
+        String id = "rId" + index;
+        usedRelationshipIds.add(id);
+        return id;
+    }
+
+    private String nextZipEntryName(String preferredEntryName, Set<String> usedEntryNames) {
+        if (!usedEntryNames.contains(preferredEntryName)) {
+            usedEntryNames.add(preferredEntryName);
+            return preferredEntryName;
+        }
+        String extension = FilenameUtils.getExtension(preferredEntryName);
+        String baseWithoutExtension = extension == null || extension.isBlank()
+            ? preferredEntryName
+            : preferredEntryName.substring(0, preferredEntryName.length() - extension.length() - 1);
+        int index = 1;
+        while (true) {
+            String candidate = extension == null || extension.isBlank()
+                ? baseWithoutExtension + "-rebuild-" + index
+                : baseWithoutExtension + "-rebuild-" + index + "." + extension;
+            if (!usedEntryNames.contains(candidate)) {
+                usedEntryNames.add(candidate);
+                return candidate;
+            }
+            index++;
+        }
+    }
+
+    private String resolveZipTarget(String baseDocumentEntry, String relativeTarget) {
+        String base = baseDocumentEntry.replace('\\', '/');
+        int slash = base.lastIndexOf('/');
+        String directory = slash >= 0 ? base.substring(0, slash + 1) : "";
+        String resolved = java.net.URI.create("file:///" + directory).resolve(relativeTarget).getPath();
+        if (resolved.startsWith("/")) {
+            resolved = resolved.substring(1);
+        }
+        return resolved;
+    }
+
+    private String relativizeZipTarget(String baseDocumentEntry, String absoluteTargetEntry) {
+        String base = baseDocumentEntry.replace('\\', '/');
+        int slash = base.lastIndexOf('/');
+        String directory = slash >= 0 ? base.substring(0, slash + 1) : "";
+        java.net.URI baseUri = java.net.URI.create("file:///" + directory);
+        java.net.URI targetUri = java.net.URI.create("file:///" + absoluteTargetEntry.replace('\\', '/'));
+        return baseUri.relativize(targetUri).getPath();
+    }
+
     private void clearRunDirectFormatting(XWPFRun run) {
         if (run != null && run.getCTR() != null && run.getCTR().isSetRPr()) {
             run.getCTR().unsetRPr();
@@ -1933,6 +2376,10 @@ public class DocxStyleService {
             }
             return format == null || !"bullet".equalsIgnoreCase(format);
         }
+    }
+
+    private record RelationshipInfo(String id, String type, String target, boolean external) {
+
     }
 
     private static final class ParagraphTraversalState {
